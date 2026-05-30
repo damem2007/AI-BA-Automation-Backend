@@ -14,7 +14,7 @@ def get_allowed_origins():
     # Enterprise deployments should provide exact app origins through environment config.
     origins = os.getenv(
         "CORS_ALLOWED_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000",
+        "http://localhost:3000,http://127.0.0.1:3000,https://ai-ba-automation-frontend-o8tozqfzm-damem2007s-projects.vercel.appLOWED_ORIGINS=",
     )
     return [origin.strip() for origin in origins.split(",") if origin.strip()]
 
@@ -26,7 +26,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=get_allowed_origins(),
     # Credentials stay disabled unless auth moves to browser-managed cookies.
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
