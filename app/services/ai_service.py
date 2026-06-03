@@ -38,6 +38,8 @@ def analyze_transcript(
     country: Optional[str] = None,
     source_intent: str = "unknown",
     source_subtype: Optional[str] = None,
+    prior_analysis: Optional[dict] = None,
+    refinement_instruction: Optional[str] = None,
 ) -> CBAKFAnalysisOutput:
    # Build canonical context before prompting so UI orchestration drives analysis.
    source_bundle = build_source_bundle(source_text, source_files)
@@ -91,8 +93,17 @@ def analyze_transcript(
        selected_outputs=selected_outputs,
        strategic_analysis_enabled=strategic_analysis_enabled,
        country=country,
+       prior_analysis=prior_analysis,
+       refinement_instruction=refinement_instruction,
    )
-   full_prompt = f"{context_prompt}\n\n{source_bundle}".strip()
+   prior_context = ""
+   if prior_analysis:
+       # Refinement must build on the current canonical model rather than starting from a blank analysis.
+       prior_context = (
+           "\n\nCurrent saved canonical analysis to refine:\n"
+           f"{json.dumps(prior_analysis, indent=2, default=str)}"
+       )
+   full_prompt = f"{context_prompt}{prior_context}\n\n{source_bundle}".strip()
 
    completion = client.beta.chat.completions.parse(
         model="gpt-4.1-mini",
@@ -155,6 +166,14 @@ def analyze_transcript(
                 recommendations, or output_views thin when the source material
                 supports richer BA artifacts.
 
+                Keep integration requirement outputs distinct from integration
+                system/interface objects. Use semantic_model.requirements.integration
+                for integration requirements and prefer ids like REQ-INT-001.
+                Use semantic_model.integrations for systems, applications,
+                interfaces, APIs, handoffs, data exchanges, or external service
+                objects and prefer ids like SYS-INT-001. Do not mix these two
+                concepts.
+
                 If orchestration selections are empty and AI inference is
                 allowed, infer BABOK activities, techniques, competencies, and
                 outputs from the evidence. Flag all inferred mappings in
@@ -203,6 +222,8 @@ def build_context_prompt(
     country: Optional[str],
     source_intent: str = "unknown",
     source_subtype: Optional[str] = None,
+    prior_analysis: Optional[dict] = None,
+    refinement_instruction: Optional[str] = None,
 ) -> str:
     domain_context = domain or "Infer the business domain from the source materials and project context."
     country_context = f"\n    Country/Region: {country}" if country else ""
@@ -261,6 +282,13 @@ def build_context_prompt(
     Produce detailed BA-ready outputs, not short labels. Each relevant semantic
     entity should describe evidence, impact, relationships, and next-step
     implications where supported by the source material.
+
+    Refinement mode:
+    {refinement_instruction or "This is an initial analysis run."}
+    If this is a refinement run, preserve still-valid prior findings, improve
+    or expand weak areas, add new evidence-supported findings, and avoid
+    discarding previous semantic entities unless the source or refinement
+    context clearly supersedes them.
 
     Strategic analysis enabled: {str(strategic_enabled).lower()}
     """

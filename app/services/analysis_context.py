@@ -435,6 +435,7 @@ BABOK_FOCUS_AREAS: List[Dict[str, object]] = [
 TECHNICAL_FOCUS_KEYS = {
     "technical-analysis",
     "data-dictionary",
+    "data-mapping-matrix",
     "data-flow-diagrams",
     "data-modelling",
     "interface-analysis",
@@ -666,6 +667,11 @@ def build_orchestration_context(
 
     return {
         "business_domain": domain or "infer",
+        # Persist keys and labels so later refinement runs can distinguish new work from re-analysis.
+        "selected_activity_keys": activity_keys or [],
+        "selected_activity_labels": [
+            str(activity["label"]) for activity in selected_activities
+        ],
         "babok_activities": [
             str(activity["label"]) for activity in selected_activities
         ],

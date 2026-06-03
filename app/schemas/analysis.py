@@ -47,6 +47,20 @@ class TranscriptRequest(BaseModel):
      source_intent: SourceIntent = "unknown"
      source_subtype: Optional[str] = None
 
+
+class RefinementRequest(BaseModel):
+     # Refinement runs reuse the latest saved canonical model, then apply a new BA activity lens.
+     selected_activity_keys: Optional[List[str]] = None
+     selected_activity_labels: Optional[List[str]] = None
+     selected_techniques: Optional[List[str]] = None
+     include_previous_activities: bool = False
+     allow_ai_inference: bool = True
+     infer_additional_techniques: bool = True
+     selected_outputs: Optional[List[str]] = None
+     source_files: Optional[List[SourceFileInput]] = None
+     refinement_output_mode: Literal["aggregated", "phase_only"] = "aggregated"
+     current_version_id: Optional[int] = None
+
 class UserStory(BaseModel):
     role: str
     goal: str
@@ -176,6 +190,8 @@ class ProjectMetadata(BaseModel):
 
 class AnalysisOrchestration(BaseModel):
     business_domain: str = ""
+    selected_activity_keys: List[str] = Field(default_factory=list)
+    selected_activity_labels: List[str] = Field(default_factory=list)
     babok_activities: List[str] = Field(default_factory=list)
     babok_chapters: List[str] = Field(default_factory=list)
     selected_techniques: List[str] = Field(default_factory=list)
@@ -186,6 +202,23 @@ class AnalysisOrchestration(BaseModel):
     source_material_types: List[str] = Field(default_factory=list)
     strategic_analysis_enabled: bool = False
     inference_notes: List[str] = Field(default_factory=list)
+    # These fields make BABOK phase progression explicit without changing the canonical output model.
+    refinement_phase: int = 1
+    activity_run_history: List["ActivityRun"] = Field(default_factory=list)
+    rerun_warnings: List[str] = Field(default_factory=list)
+
+
+class ActivityRun(BaseModel):
+    phase: int = 1
+    version_id: Optional[int] = None
+    previous_version_id: Optional[int] = None
+    selected_activity_keys: List[str] = Field(default_factory=list)
+    selected_activities: List[str] = Field(default_factory=list)
+    rerun_activity_keys: List[str] = Field(default_factory=list)
+    rerun_activities: List[str] = Field(default_factory=list)
+    selected_techniques: List[str] = Field(default_factory=list)
+    created_at: str = ""
+    note: str = ""
 
 
 class MetadataItem(BaseModel):
@@ -354,4 +387,3 @@ class CBAKFAnalysisOutput(BaseModel):
     governance_analysis: GovernanceAnalysis = Field(default_factory=GovernanceAnalysis)
     output_views: OutputViews = Field(default_factory=OutputViews)
     engagement_context: EngagementContext = Field(default_factory=EngagementContext)
-
