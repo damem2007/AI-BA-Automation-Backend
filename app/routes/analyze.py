@@ -6,7 +6,7 @@ from typing import List, Literal, Optional
 
 from app.database import SessionLocal
 from app.models import AnalysisArtifact, ArtifactVersion
-from app.schemas.analysis import RefinementRequest, TranscriptRequest
+from app.schemas.analysis import RELATIONSHIP_TYPES, RefinementRequest, TranscriptRequest
 from app.services.analysis_context import (
     BA_ACTIVITY_AREAS,
     BABOK_FOCUS_AREAS,
@@ -14,6 +14,7 @@ from app.services.analysis_context import (
 )
 from app.services.ai_service import analyze_transcript
 from app.services.export_service import build_export
+from app.services.traceability import build_traceability_matrix as build_canonical_traceability_matrix
 from datetime import datetime, timezone
 
 router = APIRouter()
@@ -236,15 +237,18 @@ def infer_relationship_type(source_type: str, target_type: str) -> str:
         ("requirement", "user_story"): "implements",
         ("feature", "user_story"): "implements",
         ("user_story", "acceptance_criterion"): "validates",
-        ("acceptance_criterion", "uat_scenario"): "validated_by",
+        ("acceptance_criterion", "uat_scenario"): "tests",
         ("constraint", "requirement"): "constrains",
-        ("risk", "control"): "mitigated_by",
         ("control", "risk"): "mitigates",
         ("stakeholder", "process"): "owns",
+        ("stakeholder", "requirement"): "approves",
+        ("stakeholder", "business_objective"): "sponsors",
+        ("stakeholder", "capability"): "owns",
+        ("stakeholder", "user_story"): "executes",
         ("integration", "data_entity"): "produces",
         ("integration", "system"): "integrates_with",
     }
-    return mapping.get((source_type, target_type), "related_to")
+    return mapping.get((source_type, target_type))
 
 
 def relationship_description(
@@ -278,15 +282,16 @@ def canonical_relationships(analysis_json: dict) -> list[dict]:
         source_type = relationship.get("source_type") or source_entity.get("type") or "entity"
         target_type = relationship.get("target_type") or target_entity.get("type") or "entity"
         inferred_type = infer_relationship_type(source_type, target_type)
-        relationship_type = relationship.get("relationship_type") or inferred_type
-        if relationship_type == "related_to" and inferred_type != "related_to":
+        relationship_type = relationship.get("relationship_type")
+        if relationship_type not in RELATIONSHIP_TYPES:
             relationship_type = inferred_type
+        if not relationship_type:
+            continue
         key = (source, target, relationship_type)
         if key in seen:
             continue
         seen.add(key)
         relationships.append({
-            "id": relationship.get("id") or f"rel-{source}-{target}",
             "source_id": source,
             "source_type": source_type,
             "relationship_type": relationship_type,
@@ -297,7 +302,6 @@ def canonical_relationships(analysis_json: dict) -> list[dict]:
             ),
             "source_reference": relationship.get("source_reference") or "",
             "confidence": relationship.get("confidence") or 0,
-            "metadata": relationship.get("metadata") or [],
         })
 
     for entity_id, entity in registry.items():
@@ -307,12 +311,13 @@ def canonical_relationships(analysis_json: dict) -> list[dict]:
             if not target_entity:
                 continue
             relationship_type = infer_relationship_type(entity["type"], target_entity["type"])
+            if not relationship_type:
+                continue
             key = (entity_id, target, relationship_type)
             if not target or key in seen:
                 continue
             seen.add(key)
             relationships.append({
-                "id": f"rel-{entity_id}-{target}",
                 "source_id": entity_id,
                 "source_type": entity["type"],
                 "relationship_type": relationship_type,
@@ -321,7 +326,6 @@ def canonical_relationships(analysis_json: dict) -> list[dict]:
                 "description": relationship_description(entity, relationship_type, target_entity),
                 "source_reference": entity.get("source_reference") or "",
                 "confidence": entity.get("confidence") or 0,
-                "metadata": [],
             })
     return relationships
 
@@ -410,7 +414,7 @@ def semantic_version_comparison(from_analysis: dict, to_analysis: dict) -> dict:
     }
 
 
-def build_traceability_matrix(relationships: list[dict], registry: dict[str, dict]) -> list[dict]:
+def build_traceability_links(relationships: list[dict], registry: dict[str, dict]) -> list[dict]:
     delivery_relationships = [
         relationship
         for relationship in relationships
@@ -425,6 +429,11 @@ def build_traceability_matrix(relationships: list[dict], registry: dict[str, dic
         }
         for relationship in delivery_relationships
     ]
+
+
+def enrich_relationships(analysis: dict) -> dict:
+    analysis["entity_relationships"] = canonical_relationships(analysis)
+    return analysis
 
 
 def build_traceability_chains(matrix: list[dict], registry: dict[str, dict]) -> list[list[dict]]:
@@ -525,7 +534,7 @@ def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
             status_code=502,
             detail=f"Analysis service failed: {error}",
         ) from error
-    analysis_payload = analysis.model_dump()
+    analysis_payload = enrich_relationships(analysis.model_dump())
     initial_orchestration = analysis_payload.setdefault("analysis_orchestration", {})
     # Initial analysis is recorded as phase one so artifact refinement has a visible BABOK breadcrumb.
     initial_orchestration.setdefault("refinement_phase", 1)
@@ -590,7 +599,27 @@ def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
     db.add(initial_version)
     db.flush()
     # Phase 1 is a first-class version so later ?phase=1 navigation stays stable.
-    artifact.analysis_json["analysis_orchestration"]["activity_run_history"][0]["version_id"] = initial_version.id
+    history = artifact.analysis_json.get("analysis_orchestration", {}).get("activity_run_history") or []
+    if history:
+        history[0]["version_id"] = initial_version.id
+        artifact.analysis_json["analysis_orchestration"]["activity_run_history"] = history
+    else:
+        # Fallback: synthesize Phase 1 history if missing
+        artifact.analysis_json.setdefault("analysis_orchestration", {})["activity_run_history"] = [
+            {
+                "phase": 1,
+                "version_id": initial_version.id,
+                "previous_version_id": None,
+                "selected_activity_keys": request.selected_activity_keys or [],
+                "selected_activities": request.selected_activity_labels or [],
+                "rerun_activity_keys": [],
+                "rerun_activities": [],
+                "selected_techniques": request.selected_techniques or [],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "note": "Initial canonical analysis run.",
+            }
+        ]
+    
     initial_version.analysis_json = artifact.analysis_json
     artifact.current_version_id = initial_version.id
     db.commit()
@@ -843,7 +872,7 @@ def refine_artifact(
             detail=f"Refinement service failed: {error}",
         ) from error
 
-    updated_analysis = analysis.model_dump()
+    updated_analysis = enrich_relationships(analysis.model_dump())
     orchestration = updated_analysis.setdefault("analysis_orchestration", {})
     history = list(previous_orchestration.get("activity_run_history") or [])
     phase = len(history) + 1
@@ -1092,8 +1121,12 @@ def get_artifact_traceability(artifact_id: int, db: Session = Depends(get_db)):
         for node in registry.values()
     ]
     relationships = canonical_relationships(analysis)
-    traceability_matrix = build_traceability_matrix(relationships, registry)
-    traceability_chains = build_traceability_chains(traceability_matrix, registry)
+    traceability_links = build_traceability_links(relationships, registry)
+    traceability_matrix = build_canonical_traceability_matrix({
+        **analysis,
+        "entity_relationships": relationships,
+    })
+    traceability_chains = build_traceability_chains(traceability_links, registry)
     linked_ids = {
         entity_id
         for relationship in relationships
@@ -1112,6 +1145,7 @@ def get_artifact_traceability(artifact_id: int, db: Session = Depends(get_db)):
         "nodes": nodes,
         "relationships": relationships,
         "traceability_matrix": traceability_matrix,
+        "traceability_links": traceability_links,
         "traceability_chains": traceability_chains,
         "source_traceability": [
             {"source_reference": source, "entity_ids": entity_ids}
@@ -1222,6 +1256,7 @@ def update_artifact(
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact not found")
 
+    updated_analysis = enrich_relationships(updated_analysis)
     updated_phase = get_analysis_phase(updated_analysis)
     artifact_head_phase = get_analysis_phase(artifact.analysis_json or {})
     new_version = ArtifactVersion(

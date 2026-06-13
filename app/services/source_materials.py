@@ -4,11 +4,13 @@ from io import BytesIO
 from typing import Dict, List, Optional
 from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree
+from pypdf import PdfReader
 
 
 TEXT_EXTENSIONS = {".txt", ".csv", ".md", ".rtf", ".bpmn", ".xml"}
 DOCX_EXTENSIONS = {".docx"}
 XLSX_EXTENSIONS = {".xlsx"}
+PDF_EXTENSIONS = {".pdf"}
 # File types become source-context metadata even when text extraction is not possible.
 SOURCE_TYPE_BY_EXTENSION = {
     ".mp3": "audio",
@@ -136,7 +138,8 @@ def classify_source_type(name: str, media_type: str) -> str:
         return "audio"
     if media_type.startswith("image/"):
         return "image"
-    if media_type == "application/pdf":
+    #if media_type == "application/pdf":
+    if extension in PDF_EXTENSIONS or media_type in {"application/pdf", "pdf"}:
         return "pdf"
     if "spreadsheet" in media_type or "excel" in media_type:
         return "spreadsheet"
@@ -185,8 +188,30 @@ def extract_file_text(content: bytes, extension: str, media_type: str) -> str:
         return extract_xlsx_text(content)
     if extension in TEXT_EXTENSIONS or media_type.startswith("text/"):
         return extract_plain_text(content, extension)
+    if extension in PDF_EXTENSIONS or media_type == "application/pdf":
+        return extract_pdf_text(content)
     return ""
 
+def extract_pdf_text(content: bytes) -> str:
+    try:
+        reader = PdfReader(BytesIO(content))
+    except Exception:
+        return ""
+
+    pages = []
+
+    for index, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+
+        text = normalize_text(text)
+
+        if text:
+            pages.append(f"[Page {index}]\n{text}")
+
+    return normalize_text("\n\n".join(pages))
 
 def extract_plain_text(content: bytes, extension: str) -> str:
     text = content.decode("utf-8", errors="ignore")

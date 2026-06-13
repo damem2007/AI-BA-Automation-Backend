@@ -20,7 +20,7 @@ if not api_key:
     raise ValueError("OPENAI_API_KEY environment variable is not set")
 
 client = OpenAI(api_key=api_key)
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4-mini")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 def analyze_transcript(
     project_name: str,
@@ -310,10 +310,12 @@ def build_context_prompt(
 
     Generate entity_relationships only after extracting the canonical model.
     Relationships must connect meaningful business analysis entities, not merely
-    names appearing in the same source. Do not use generic related_to unless no
-    specific relationship applies. Prefer: drives, supports, depends_on,
-    constrains, implements, validates, tests, mitigates, owns, consumes,
-    produces, integrates_with, and impacts.
+    names appearing in the same source. Relationship names are controlled:
+    drives, supports, depends_on, implements, constrains, owns, approves,
+    produces, consumes, integrates_with, validates, tests, mitigates, impacts.
+    For stakeholder lineage, also use: sponsors, owns, approves,
+    acts_as_sme_for, executes, consulted_on, and informed_of.
+    Do not create a relationship when none of these types accurately applies.
 
     Prioritize relationships between objectives and capabilities, capabilities
     and requirements, requirements and integrations/data entities/risks/user
@@ -328,6 +330,48 @@ def build_context_prompt(
     executive_translation, and enterprise_intelligence from evidence-supported
     findings. Enterprise intelligence must identify controls, systems,
     integrations, data flows, and integration controls where supported.
+
+    Generate exhaustive, evidence-supported functional requirements,
+    non-functional requirements, integration requirements, user stories,
+    acceptance criteria, test scenarios, negative tests, edge cases, regression
+    tests, API validation suggestions, test data needs, and UAT readiness risks.
+    Exhaustive means cover every distinct supported behavior, quality attribute,
+    integration contract, business rule, exception path, role/permission need,
+    data validation rule, boundary condition, and failure mode without inventing
+    unsupported scope or duplicating equivalent findings.
+
+    For impact_analysis, translate the change or source material into impacted
+    systems, workflows, integrations, reports, data entities, roles, controls,
+    downstream processes, testing scope, implementation risks, rollback
+    considerations, release readiness checks, stakeholder notifications, and
+    recommendations.
+
+    For executive_translation, translate executive intent into delivery
+    interpretation, impacted capabilities and workflows, system dependencies,
+    data needs, risk checks, operational metrics, backlog recommendations, and
+    validation questions.
+
+    Generate test_intelligence from requirements, processes, integrations,
+    business rules, risks, user stories, acceptance criteria, and
+    entity_relationships. Include evidence-supported positive test scenarios,
+    edge cases, negative tests, regression pack candidates, API validation
+    suggestions, defect categories, test data needs, environment needs, and UAT
+    readiness risks. Prioritize integration failure paths, validation rules,
+    role/access scenarios, reporting outputs, data synchronization,
+    reconciliation flows, exception paths, and compliance-sensitive workflows.
+    Do not generate generic tests. Each test must reference related canonical
+    requirements, integrations, workflows, data entities, risks, or business rules.
+    Test intelligence is mandatory for every analysis. If evidence is
+    insufficient for a concrete test, record the missing acceptance criteria,
+    untestable requirement, test-data gap, environment dependency, or UAT
+    readiness risk instead of skipping the section or inventing a generic test.
+
+    Stakeholders are canonical entities. Preserve who sponsors or owns objectives
+    and capabilities, who approves or acts as SME for requirements, which user
+    personas execute stories or processes, and who must be consulted or informed.
+
+    Do not generate or persist a traceability matrix. Traceability is a dynamic
+    API projection built from entity_relationships.
 
     Refinement mode:
     {refinement_instruction or "This is an initial analysis run."}

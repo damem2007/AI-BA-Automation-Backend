@@ -1,6 +1,30 @@
 from pydantic import BaseModel, Field
 from typing import List, Literal, Optional
 
+RelationshipType = Literal[
+    "drives",
+    "supports",
+    "depends_on",
+    "implements",
+    "constrains",
+    "owns",
+    "approves",
+    "produces",
+    "consumes",
+    "integrates_with",
+    "validates",
+    "tests",
+    "mitigates",
+    "impacts",
+    "sponsors",
+    "acts_as_sme_for",
+    "executes",
+    "consulted_on",
+    "informed_of",
+]
+
+RELATIONSHIP_TYPES = list(RelationshipType.__args__)
+
 ## Further analysis to make the orchestration smarter.
 SourceIntent = Literal[
     "elicitation",
@@ -296,16 +320,14 @@ class ActionPoint(BaseModel):
 
 
 class EntityRelationship(BaseModel):
-    id: str = ""
     source_id: str = ""
     source_type: str = ""
-    relationship_type: str = "related_to"
+    relationship_type: RelationshipType
     target_id: str = ""
     target_type: str = ""
     description: str = ""
-    source_reference: str = ""
     confidence: float = 0
-    metadata: List[MetadataItem] = Field(default_factory=list)
+    source_reference: str = ""
 
 
 class SemanticModel(BaseModel):
@@ -374,29 +396,81 @@ class ProcessIntelligence(BaseModel):
 
 
 class TestIntelligence(BaseModel):
-    test_objectives: List[SemanticEntity] = Field(default_factory=list)
-    test_scenarios: List[SemanticEntity] = Field(default_factory=list)
-    coverage_gaps: List[SemanticEntity] = Field(default_factory=list)
-    quality_risks: List[SemanticEntity] = Field(default_factory=list)
-    validation_rules: List[SemanticEntity] = Field(default_factory=list)
+    test_scenarios: List["TestCaseEntity"] = Field(default_factory=list)
+    edge_cases: List["TestCaseEntity"] = Field(default_factory=list)
+    negative_tests: List["TestCaseEntity"] = Field(default_factory=list)
+    regression_pack: List["TestCaseEntity"] = Field(default_factory=list)
+    api_validation_suggestions: List["ApiValidationSuggestion"] = Field(default_factory=list)
+    defect_categories: List["DefectCategory"] = Field(default_factory=list)
+    test_data_needs: List[SemanticEntity] = Field(default_factory=list)
+    environment_needs: List[SemanticEntity] = Field(default_factory=list)
+    uat_readiness_risks: List[SemanticEntity] = Field(default_factory=list)
+
+
+class TestCaseEntity(BaseModel):
+    id: str = ""
+    name: str = ""
+    description: str = ""
+    test_type: str = ""
+    priority: str = ""
+    preconditions: List[str] = Field(default_factory=list)
+    steps: List[str] = Field(default_factory=list)
+    expected_result: str = ""
+    related_entities: List[str] = Field(default_factory=list)
+    source_reference: str = ""
+    confidence: float = 0
+    metadata: List[MetadataItem] = Field(default_factory=list)
+
+
+class ApiValidationSuggestion(BaseModel):
+    id: str = ""
+    endpoint_or_interface: str = ""
+    validation_focus: str = ""
+    suggestion: str = ""
+    related_entities: List[str] = Field(default_factory=list)
+    source_reference: str = ""
+    confidence: float = 0
+
+
+class DefectCategory(BaseModel):
+    id: str = ""
+    category: str = ""
+    description: str = ""
+    likely_causes: List[str] = Field(default_factory=list)
+    related_entities: List[str] = Field(default_factory=list)
+    source_reference: str = ""
+    confidence: float = 0
 
 
 class ImpactAnalysis(BaseModel):
-    impacted_stakeholders: List[SemanticEntity] = Field(default_factory=list)
-    impacted_processes: List[SemanticEntity] = Field(default_factory=list)
+    change_summary: SemanticEntity = Field(default_factory=SemanticEntity)
     impacted_systems: List[SemanticEntity] = Field(default_factory=list)
-    impacted_data: List[SemanticEntity] = Field(default_factory=list)
-    change_risks: List[SemanticEntity] = Field(default_factory=list)
-    downstream_impacts: List[SemanticEntity] = Field(default_factory=list)
+    impacted_workflows: List[SemanticEntity] = Field(default_factory=list)
+    impacted_integrations: List[SemanticEntity] = Field(default_factory=list)
+    impacted_reports: List[SemanticEntity] = Field(default_factory=list)
+    impacted_data_entities: List[SemanticEntity] = Field(default_factory=list)
+    impacted_roles: List[SemanticEntity] = Field(default_factory=list)
+    impacted_controls: List[SemanticEntity] = Field(default_factory=list)
+    impacted_downstream_processes: List[SemanticEntity] = Field(default_factory=list)
+    testing_scope: List[SemanticEntity] = Field(default_factory=list)
+    implementation_risks: List[SemanticEntity] = Field(default_factory=list)
+    rollback_considerations: List[SemanticEntity] = Field(default_factory=list)
+    release_readiness_checks: List[SemanticEntity] = Field(default_factory=list)
+    stakeholder_notifications: List[SemanticEntity] = Field(default_factory=list)
+    recommendations: List[SemanticEntity] = Field(default_factory=list)
 
 
 class ExecutiveTranslation(BaseModel):
-    decision_summary: str = ""
-    business_value: str = ""
-    investment_case: str = ""
-    delivery_outlook: str = ""
-    top_risks: List[SemanticEntity] = Field(default_factory=list)
-    decisions_required: List[SemanticEntity] = Field(default_factory=list)
+    executive_goal: str = ""
+    delivery_interpretation: List[SemanticEntity] = Field(default_factory=list)
+    impacted_capabilities: List[SemanticEntity] = Field(default_factory=list)
+    impacted_workflows: List[SemanticEntity] = Field(default_factory=list)
+    system_dependencies: List[SemanticEntity] = Field(default_factory=list)
+    data_needs: List[SemanticEntity] = Field(default_factory=list)
+    risk_checks: List[SemanticEntity] = Field(default_factory=list)
+    operational_metrics: List[SemanticEntity] = Field(default_factory=list)
+    backlog_recommendations: List[SemanticEntity] = Field(default_factory=list)
+    validation_questions: List[SemanticEntity] = Field(default_factory=list)
 
 
 class EnterpriseIntelligence(BaseModel):

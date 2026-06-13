@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes.analyze import router as analyze_router
+from app.routes.auth import router as auth_router
 
 
 load_dotenv()
@@ -32,8 +33,9 @@ app.add_middleware(
 )
 
 app.include_router(analyze_router)
+app.include_router(auth_router)
 
 @app.get("/")
 
 def root():
-    return {"message": "BA Artifact Automation API Running"}
+    return {"message": "BA Process Automation API Running"}
