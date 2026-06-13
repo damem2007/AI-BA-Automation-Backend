@@ -131,6 +131,328 @@ def get_analysis_phase(analysis_json: dict) -> int:
     )
 
 
+def artifact_version_numbers(db: Session, artifact_id: int) -> dict[int, int]:
+    versions = (
+        db.query(ArtifactVersion)
+        .filter(ArtifactVersion.artifact_id == artifact_id)
+        .order_by(ArtifactVersion.created_at.asc(), ArtifactVersion.id.asc())
+        .all()
+    )
+    return {version.id: index + 1 for index, version in enumerate(versions)}
+
+
+def version_label(version_id: int, version_numbers: dict[int, int]) -> dict:
+    number = version_numbers.get(version_id, 1)
+    return {"version_number": number, "display_name": f"Version {number}"}
+
+
+ENTITY_TYPE_BY_PATH = {
+    "business_objectives": "business_objective",
+    "capabilities": "capability",
+    "requirements": "requirement",
+    "stakeholders": "stakeholder",
+    "risks": "risk",
+    "constraints": "constraint",
+    "integrations": "integration",
+    "data_entities": "data_entity",
+    "processes": "process",
+    "features": "feature",
+    "user_stories": "user_story",
+    "acceptance_criteria": "acceptance_criterion",
+    "uat_scenarios": "uat_scenario",
+    "controls": "control",
+    "systems": "system",
+    "data_flows": "data_flow",
+}
+
+DELIVERY_TRACEABILITY_TYPES = {
+    "business_objective",
+    "capability",
+    "requirement",
+    "feature",
+    "user_story",
+    "acceptance_criterion",
+    "uat_scenario",
+}
+
+
+def entity_type_for_path(path: list[str]) -> str:
+    for part in reversed(path):
+        if part in ENTITY_TYPE_BY_PATH:
+            return ENTITY_TYPE_BY_PATH[part]
+    value = path[-1] if path else "entity"
+    return value[:-1] if value.endswith("s") else value
+
+
+def entity_registry(analysis_json: dict) -> dict[str, dict]:
+    registry = {}
+
+    def visit(value, path: list[str]):
+        if isinstance(value, dict):
+            if value.get("id") and "entity_relationships" not in path:
+                entity_id = str(value["id"])
+                entity_type = entity_type_for_path(path)
+                registry[entity_id] = {
+                    "id": entity_id,
+                    "type": entity_type,
+                    "name": (
+                        value.get("name")
+                        or value.get("description")
+                        or value.get("story")
+                        or value.get("scenario")
+                        or entity_id
+                    ),
+                    "description": (
+                        value.get("description")
+                        or value.get("story")
+                        or value.get("scenario")
+                        or ""
+                    ),
+                    "category": path[0] if path else "canonical",
+                    "group": path[-1] if path else "canonical",
+                    "source_reference": value.get("source_reference") or "",
+                    "confidence": value.get("confidence") or 0,
+                    "raw": value,
+                }
+            for key, child in value.items():
+                if key not in {"metadata", "entity_relationships"}:
+                    visit(child, [*path, key])
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, path)
+
+    visit(analysis_json or {}, [])
+    return registry
+
+
+def infer_relationship_type(source_type: str, target_type: str) -> str:
+    mapping = {
+        ("business_objective", "capability"): "drives",
+        ("business_objective", "requirement"): "drives",
+        ("capability", "requirement"): "supports",
+        ("requirement", "integration"): "depends_on",
+        ("requirement", "data_entity"): "consumes",
+        ("requirement", "risk"): "impacts",
+        ("requirement", "user_story"): "implements",
+        ("feature", "user_story"): "implements",
+        ("user_story", "acceptance_criterion"): "validates",
+        ("acceptance_criterion", "uat_scenario"): "validated_by",
+        ("constraint", "requirement"): "constrains",
+        ("risk", "control"): "mitigated_by",
+        ("control", "risk"): "mitigates",
+        ("stakeholder", "process"): "owns",
+        ("integration", "data_entity"): "produces",
+        ("integration", "system"): "integrates_with",
+    }
+    return mapping.get((source_type, target_type), "related_to")
+
+
+def relationship_description(
+    source: dict,
+    relationship_type: str,
+    target: dict,
+) -> str:
+    verb = relationship_type.replace("_", " ")
+    return f"{source['name']} {verb} {target['name']}."
+
+
+def canonical_relationships(analysis_json: dict) -> list[dict]:
+    semantic_model = (analysis_json or {}).get("semantic_model") or {}
+    explicit = [
+        *((analysis_json or {}).get("entity_relationships") or []),
+        *(semantic_model.get("entity_relationships") or []),
+    ]
+    registry = entity_registry(analysis_json)
+    relationships = []
+    seen = set()
+
+    for relationship in explicit:
+        if not isinstance(relationship, dict):
+            continue
+        source = str(relationship.get("source_id") or relationship.get("source_entity_id") or "")
+        target = str(relationship.get("target_id") or relationship.get("target_entity_id") or "")
+        if not source or not target:
+            continue
+        source_entity = registry.get(source, {"name": source, "type": relationship.get("source_type") or "entity"})
+        target_entity = registry.get(target, {"name": target, "type": relationship.get("target_type") or "entity"})
+        source_type = relationship.get("source_type") or source_entity.get("type") or "entity"
+        target_type = relationship.get("target_type") or target_entity.get("type") or "entity"
+        inferred_type = infer_relationship_type(source_type, target_type)
+        relationship_type = relationship.get("relationship_type") or inferred_type
+        if relationship_type == "related_to" and inferred_type != "related_to":
+            relationship_type = inferred_type
+        key = (source, target, relationship_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        relationships.append({
+            "id": relationship.get("id") or f"rel-{source}-{target}",
+            "source_id": source,
+            "source_type": source_type,
+            "relationship_type": relationship_type,
+            "target_id": target,
+            "target_type": target_type,
+            "description": relationship.get("description") or relationship_description(
+                source_entity, relationship_type, target_entity
+            ),
+            "source_reference": relationship.get("source_reference") or "",
+            "confidence": relationship.get("confidence") or 0,
+            "metadata": relationship.get("metadata") or [],
+        })
+
+    for entity_id, entity in registry.items():
+        for target in entity["raw"].get("related_entities") or []:
+            target = str(target)
+            target_entity = registry.get(target)
+            if not target_entity:
+                continue
+            relationship_type = infer_relationship_type(entity["type"], target_entity["type"])
+            key = (entity_id, target, relationship_type)
+            if not target or key in seen:
+                continue
+            seen.add(key)
+            relationships.append({
+                "id": f"rel-{entity_id}-{target}",
+                "source_id": entity_id,
+                "source_type": entity["type"],
+                "relationship_type": relationship_type,
+                "target_id": target,
+                "target_type": target_entity["type"],
+                "description": relationship_description(entity, relationship_type, target_entity),
+                "source_reference": entity.get("source_reference") or "",
+                "confidence": entity.get("confidence") or 0,
+                "metadata": [],
+            })
+    return relationships
+
+
+def semantic_version_comparison(from_analysis: dict, to_analysis: dict) -> dict:
+    before_entities = entity_registry(from_analysis)
+    after_entities = entity_registry(to_analysis)
+    before_relationships = {
+        (item["source_id"], item["relationship_type"], item["target_id"]): item
+        for item in canonical_relationships(from_analysis)
+    }
+    after_relationships = {
+        (item["source_id"], item["relationship_type"], item["target_id"]): item
+        for item in canonical_relationships(to_analysis)
+    }
+
+    entity_changes = []
+    for entity_id in sorted(set(before_entities) | set(after_entities)):
+        before = before_entities.get(entity_id)
+        after = after_entities.get(entity_id)
+        if before and after and before["raw"] == after["raw"]:
+            continue
+        status = "added" if not before else "removed" if not after else "modified"
+        current = after or before
+        changed_fields = []
+        if before and after:
+            changed_fields = [
+                key
+                for key in sorted(set(before["raw"]) | set(after["raw"]))
+                if before["raw"].get(key) != after["raw"].get(key)
+                and key not in {"metadata", "related_entities"}
+            ]
+        entity_changes.append({
+            "status": status,
+            "entity_id": entity_id,
+            "entity_type": current["type"],
+            "name": current["name"],
+            "description": current["description"],
+            "changed_fields": changed_fields,
+        })
+
+    relationship_changes = []
+    for key in sorted(set(before_relationships) | set(after_relationships)):
+        before = before_relationships.get(key)
+        after = after_relationships.get(key)
+        if before == after:
+            continue
+        status = "added" if not before else "removed" if not after else "modified"
+        relationship_changes.append({"status": status, **(after or before)})
+
+    intelligence_changes = []
+    for section in (
+        "process_intelligence",
+        "test_intelligence",
+        "impact_analysis",
+        "executive_translation",
+        "enterprise_intelligence",
+    ):
+        before = (from_analysis or {}).get(section) or {}
+        after = (to_analysis or {}).get(section) or {}
+        if before == after:
+            continue
+        changed_fields = [
+            key
+            for key in sorted(set(before) | set(after))
+            if before.get(key) != after.get(key)
+        ]
+        intelligence_changes.append({
+            "section": section,
+            "changed_fields": changed_fields,
+            "summary": f"{section.replace('_', ' ').title()} changed in {len(changed_fields)} areas.",
+        })
+
+    changed_sections = sorted({
+        entity["entity_type"] for entity in entity_changes
+    } | {
+        "entity_relationships" for _ in relationship_changes
+    } | {
+        change["section"] for change in intelligence_changes
+    })
+    return {
+        "section_names": changed_sections,
+        "entity_changes": entity_changes,
+        "relationship_changes": relationship_changes,
+        "intelligence_changes": intelligence_changes,
+    }
+
+
+def build_traceability_matrix(relationships: list[dict], registry: dict[str, dict]) -> list[dict]:
+    delivery_relationships = [
+        relationship
+        for relationship in relationships
+        if relationship["source_type"] in DELIVERY_TRACEABILITY_TYPES
+        and relationship["target_type"] in DELIVERY_TRACEABILITY_TYPES
+    ]
+    return [
+        {
+            **relationship,
+            "source_name": registry.get(relationship["source_id"], {}).get("name", relationship["source_id"]),
+            "target_name": registry.get(relationship["target_id"], {}).get("name", relationship["target_id"]),
+        }
+        for relationship in delivery_relationships
+    ]
+
+
+def build_traceability_chains(matrix: list[dict], registry: dict[str, dict]) -> list[list[dict]]:
+    outgoing = {}
+    incoming = set()
+    for relationship in matrix:
+        outgoing.setdefault(relationship["source_id"], []).append(relationship)
+        incoming.add(relationship["target_id"])
+    roots = [source_id for source_id in outgoing if source_id not in incoming]
+    chains = []
+
+    def walk(entity_id: str, chain: list[dict], visited: set[str]):
+        next_relationships = outgoing.get(entity_id) or []
+        if not next_relationships or len(chain) >= 7:
+            if chain:
+                chains.append(chain)
+            return
+        for relationship in next_relationships:
+            target_id = relationship["target_id"]
+            if target_id in visited:
+                continue
+            walk(target_id, [*chain, relationship], {*visited, target_id})
+
+    for root in roots:
+        walk(root, [], {root})
+    return chains[:100]
+
+
 def serialize_artifact_response(
     artifact: AnalysisArtifact,
     analysis_json: dict,
@@ -167,7 +489,7 @@ def get_db():
         db.close()
 
 @router.post("/analyze-source-materials")
-@router.post("/analyze-transcript")
+@router.post("/analyze")
 def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
     source_text = request.source_text if request.source_text is not None else request.transcript
 
@@ -305,6 +627,54 @@ def get_artifacts(db: Session = Depends(get_db)):
         }
         for artifact in artifacts
     ]
+
+
+@router.get("/analysis-artifacts-overview")
+def get_artifacts_overview(db: Session = Depends(get_db)):
+    artifacts = db.query(AnalysisArtifact).order_by(AnalysisArtifact.created_at.desc()).all()
+    versions = db.query(ArtifactVersion).all()
+    total_requirements = 0
+    total_risks = 0
+    total_open_questions = 0
+    total_relationships = 0
+    domain_counts = {}
+
+    for artifact in artifacts:
+        analysis = artifact.analysis_json or {}
+        semantic = analysis.get("semantic_model") or {}
+        requirements = semantic.get("requirements") or {}
+        total_requirements += sum(
+            len(items) for items in requirements.values() if isinstance(items, list)
+        )
+        total_risks += len(semantic.get("risks") or [])
+        total_open_questions += len(semantic.get("open_questions") or [])
+        total_relationships += len(canonical_relationships(analysis))
+        domain = artifact.domain or "Unspecified"
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+
+    return {
+        "total_projects": len({artifact.project_name for artifact in artifacts}),
+        "total_artifacts": len(artifacts),
+        "total_versions": len(versions),
+        "total_requirements": total_requirements,
+        "total_risks": total_risks,
+        "total_open_questions": total_open_questions,
+        "total_relationships": total_relationships,
+        "domain_distribution": [
+            {"name": name, "count": count}
+            for name, count in sorted(domain_counts.items(), key=lambda item: item[1], reverse=True)
+        ],
+        "recent_artifacts": [
+            {
+                "id": artifact.id,
+                "project_name": artifact.project_name,
+                "domain": artifact.domain,
+                "created_at": artifact.created_at,
+                "phase": get_analysis_phase(artifact.analysis_json or {}),
+            }
+            for artifact in artifacts[:6]
+        ],
+    }
 
 @router.get("/analysis-context/focus-areas")
 def get_focus_areas():
@@ -620,6 +990,7 @@ def get_artifact_versions(
     # The active marker must point to the newest version in the phase, even when the user is on page 2+.
     latest_version_for_phase = all_versions[0].id if phase is not None and all_versions else None
     versions = all_versions[offset : offset + page_size]
+    version_numbers = artifact_version_numbers(db, artifact_id)
 
     return {
        "page": page,
@@ -638,10 +1009,47 @@ def get_artifact_versions(
                 if phase is not None
                 else version.is_active
             ),
+            **version_label(version.id, version_numbers),
         }
         for version in versions
        ]
     }
+@router.get("/analysis-artifacts/{artifact_id}/versions/compare")
+def compare_artifact_versions(
+    artifact_id: int,
+    from_version_id: Optional[int] = None,
+    to_version_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    versions = (
+        db.query(ArtifactVersion)
+        .filter(ArtifactVersion.artifact_id == artifact_id)
+        .order_by(ArtifactVersion.created_at.asc(), ArtifactVersion.id.asc())
+        .all()
+    )
+    if len(versions) < 2:
+        raise HTTPException(status_code=400, detail="At least two versions are required to compare")
+
+    by_id = {version.id: version for version in versions}
+    from_version = by_id.get(from_version_id) if from_version_id else versions[-2]
+    to_version = by_id.get(to_version_id) if to_version_id else versions[-1]
+    if not from_version or not to_version:
+        raise HTTPException(status_code=404, detail="One or both versions were not found")
+
+    numbers = artifact_version_numbers(db, artifact_id)
+    comparison = semantic_version_comparison(
+        from_version.analysis_json or {},
+        to_version.analysis_json or {},
+    )
+    return {
+        "artifact_id": artifact_id,
+        "from_version": {"id": from_version.id, **version_label(from_version.id, numbers)},
+        "to_version": {"id": to_version.id, **version_label(to_version.id, numbers)},
+        "changed_sections": len(comparison["section_names"]),
+        **comparison,
+    }
+
+
 @router.get("/analysis-artifacts/{artifact_id}/versions/{version_id}")
 def get_artifact_version(
     artifact_id: int,
@@ -660,11 +1068,71 @@ def get_artifact_version(
     if not version:
         raise HTTPException(status_code=404, detail="Version not found")
 
+    version_numbers = artifact_version_numbers(db, artifact_id)
     return {
         "id": version.id,
         "artifact_id": version.artifact_id,
         "analysis": version.analysis_json,
-        "created_at": version.created_at
+        "created_at": version.created_at,
+        "phase": get_analysis_phase(version.analysis_json or {}),
+        **version_label(version.id, version_numbers),
+    }
+
+
+@router.get("/analysis-artifacts/{artifact_id}/traceability")
+def get_artifact_traceability(artifact_id: int, db: Session = Depends(get_db)):
+    artifact = db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    analysis = artifact.analysis_json or {}
+    registry = entity_registry(analysis)
+    nodes = [
+        {key: value for key, value in node.items() if key != "raw"}
+        for node in registry.values()
+    ]
+    relationships = canonical_relationships(analysis)
+    traceability_matrix = build_traceability_matrix(relationships, registry)
+    traceability_chains = build_traceability_chains(traceability_matrix, registry)
+    linked_ids = {
+        entity_id
+        for relationship in relationships
+        for entity_id in (
+            relationship["source_id"],
+            relationship["target_id"],
+        )
+    }
+    source_links = {}
+    for node in nodes:
+        source = node.get("source_reference") or "No source reference"
+        source_links.setdefault(source, []).append(node["id"])
+
+    return {
+        "artifact_id": artifact_id,
+        "nodes": nodes,
+        "relationships": relationships,
+        "traceability_matrix": traceability_matrix,
+        "traceability_chains": traceability_chains,
+        "source_traceability": [
+            {"source_reference": source, "entity_ids": entity_ids}
+            for source, entity_ids in source_links.items()
+        ],
+        "coverage": {
+            "total_entities": len(nodes),
+            "linked_entities": len([node for node in nodes if node["id"] in linked_ids]),
+            "unlinked_entities": [node["id"] for node in nodes if node["id"] not in linked_ids],
+            "relationship_count": len(relationships),
+            "source_referenced_entities": len(
+                [node for node in nodes if node.get("source_reference")]
+            ),
+        },
+        "intelligence": {
+            "process": analysis.get("process_intelligence") or {},
+            "test": analysis.get("test_intelligence") or {},
+            "impact": analysis.get("impact_analysis") or {},
+            "executive_translation": analysis.get("executive_translation") or {},
+            "enterprise": analysis.get("enterprise_intelligence") or {},
+        },
     }
 
 @router.post("/analysis-artifacts/{artifact_id}/versions/{version_id}/restore")

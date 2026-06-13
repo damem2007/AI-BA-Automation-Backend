@@ -62,14 +62,20 @@ class RefinementRequest(BaseModel):
      current_version_id: Optional[int] = None
 
 class UserStory(BaseModel):
+    id: str = ""
     role: str
     goal: str
     benefit: str
     story: str
+    source_reference: str = ""
+    confidence: float = 0
 
 class AcceptanceCriteria(BaseModel):
+    id: str = ""
     user_story: str
     criteria: List[str]
+    source_reference: str = ""
+    confidence: float = 0
 
 class Requirement(BaseModel):
     id: str
@@ -89,9 +95,12 @@ class Dependency(BaseModel):
 
 
 class UATScenario(BaseModel):
+    id: str = ""
     scenario: str
     steps: List[str]
     expected_result: str
+    source_reference: str = ""
+    confidence: float = 0
 
 
 class DataMappingRow(BaseModel):
@@ -286,6 +295,19 @@ class ActionPoint(BaseModel):
     related_entities: List[str] = Field(default_factory=list)
 
 
+class EntityRelationship(BaseModel):
+    id: str = ""
+    source_id: str = ""
+    source_type: str = ""
+    relationship_type: str = "related_to"
+    target_id: str = ""
+    target_type: str = ""
+    description: str = ""
+    source_reference: str = ""
+    confidence: float = 0
+    metadata: List[MetadataItem] = Field(default_factory=list)
+
+
 class SemanticModel(BaseModel):
     stakeholders: List[SemanticEntity] = Field(default_factory=list)
     business_objectives: List[SemanticEntity] = Field(default_factory=list)
@@ -342,6 +364,49 @@ class GovernanceAnalysis(BaseModel):
     compliance_constraints: List[SemanticEntity] = Field(default_factory=list)
 
 
+class ProcessIntelligence(BaseModel):
+    process_inventory: List[SemanticEntity] = Field(default_factory=list)
+    process_steps: List[SemanticEntity] = Field(default_factory=list)
+    handoffs: List[SemanticEntity] = Field(default_factory=list)
+    bottlenecks: List[SemanticEntity] = Field(default_factory=list)
+    process_controls: List[SemanticEntity] = Field(default_factory=list)
+    automation_opportunities: List[SemanticEntity] = Field(default_factory=list)
+
+
+class TestIntelligence(BaseModel):
+    test_objectives: List[SemanticEntity] = Field(default_factory=list)
+    test_scenarios: List[SemanticEntity] = Field(default_factory=list)
+    coverage_gaps: List[SemanticEntity] = Field(default_factory=list)
+    quality_risks: List[SemanticEntity] = Field(default_factory=list)
+    validation_rules: List[SemanticEntity] = Field(default_factory=list)
+
+
+class ImpactAnalysis(BaseModel):
+    impacted_stakeholders: List[SemanticEntity] = Field(default_factory=list)
+    impacted_processes: List[SemanticEntity] = Field(default_factory=list)
+    impacted_systems: List[SemanticEntity] = Field(default_factory=list)
+    impacted_data: List[SemanticEntity] = Field(default_factory=list)
+    change_risks: List[SemanticEntity] = Field(default_factory=list)
+    downstream_impacts: List[SemanticEntity] = Field(default_factory=list)
+
+
+class ExecutiveTranslation(BaseModel):
+    decision_summary: str = ""
+    business_value: str = ""
+    investment_case: str = ""
+    delivery_outlook: str = ""
+    top_risks: List[SemanticEntity] = Field(default_factory=list)
+    decisions_required: List[SemanticEntity] = Field(default_factory=list)
+
+
+class EnterpriseIntelligence(BaseModel):
+    controls: List[SemanticEntity] = Field(default_factory=list)
+    integrations: List[SemanticEntity] = Field(default_factory=list)
+    systems: List[SemanticEntity] = Field(default_factory=list)
+    data_flows: List[SemanticEntity] = Field(default_factory=list)
+    integration_controls: List[SemanticEntity] = Field(default_factory=list)
+
+
 class OutputView(BaseModel):
     title: str = ""
     summary: str = ""
@@ -382,8 +447,14 @@ class CBAKFAnalysisOutput(BaseModel):
     )
     source_context: SourceContext = Field(default_factory=SourceContext)
     semantic_model: SemanticModel = Field(default_factory=SemanticModel)
+    entity_relationships: List[EntityRelationship] = Field(default_factory=list)
     strategic_analysis: StrategicAnalysis = Field(default_factory=StrategicAnalysis)
     delivery_analysis: DeliveryAnalysis = Field(default_factory=DeliveryAnalysis)
     governance_analysis: GovernanceAnalysis = Field(default_factory=GovernanceAnalysis)
+    process_intelligence: ProcessIntelligence = Field(default_factory=ProcessIntelligence)
+    test_intelligence: TestIntelligence = Field(default_factory=TestIntelligence)
+    impact_analysis: ImpactAnalysis = Field(default_factory=ImpactAnalysis)
+    executive_translation: ExecutiveTranslation = Field(default_factory=ExecutiveTranslation)
+    enterprise_intelligence: EnterpriseIntelligence = Field(default_factory=EnterpriseIntelligence)
     output_views: OutputViews = Field(default_factory=OutputViews)
     engagement_context: EngagementContext = Field(default_factory=EngagementContext)

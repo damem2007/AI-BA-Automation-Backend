@@ -15,7 +15,12 @@ from app.services.source_materials import build_source_bundle, build_source_cont
 
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY environment variable is not set")
+
+client = OpenAI(api_key=api_key)
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4-mini")
 
 def analyze_transcript(
     project_name: str,
@@ -93,9 +98,12 @@ def analyze_transcript(
        selected_outputs=selected_outputs,
        strategic_analysis_enabled=strategic_analysis_enabled,
        country=country,
+       source_intent=source_intent,
+       source_subtype=source_subtype,
        prior_analysis=prior_analysis,
        refinement_instruction=refinement_instruction,
    )
+
    prior_context = ""
    if prior_analysis:
        # Refinement must build on the current canonical model rather than starting from a blank analysis.
@@ -106,7 +114,7 @@ def analyze_transcript(
    full_prompt = f"{context_prompt}{prior_context}\n\n{source_bundle}".strip()
 
    completion = client.beta.chat.completions.parse(
-        model="gpt-4.1-mini",
+        model=MODEL,
         messages=[
             {
              "role": "system",
@@ -191,7 +199,18 @@ def analyze_transcript(
         ],
         response_format=CBAKFAnalysisOutput,
    )
-   analysis = completion.choices[0].message.parsed
+   if not completion.choices:
+       raise ValueError("OpenAI API returned no completion choices")
+   
+   message = completion.choices[0].message
+   if message.parsed is None:
+       # Model failed to parse into schema; log error details
+       raise ValueError(
+           f"Failed to parse response into CBAKFAnalysisOutput. "
+           f"Raw content: {message.content}"
+       )
+   
+   analysis = message.parsed
    # Re-apply UI/source truth because the model may enrich, but not redefine, orchestration.
    return enforce_orchestration_source_of_truth(
        analysis,
@@ -259,6 +278,12 @@ def build_context_prompt(
     - analysis_orchestration
     - source_context
     - semantic_model
+    - entity_relationships
+    - process_intelligence
+    - test_intelligence
+    - impact_analysis
+    - executive_translation
+    - enterprise_intelligence
     - strategic_analysis
     - delivery_analysis
     - governance_analysis
@@ -282,6 +307,27 @@ def build_context_prompt(
     Produce detailed BA-ready outputs, not short labels. Each relevant semantic
     entity should describe evidence, impact, relationships, and next-step
     implications where supported by the source material.
+
+    Generate entity_relationships only after extracting the canonical model.
+    Relationships must connect meaningful business analysis entities, not merely
+    names appearing in the same source. Do not use generic related_to unless no
+    specific relationship applies. Prefer: drives, supports, depends_on,
+    constrains, implements, validates, tests, mitigates, owns, consumes,
+    produces, integrates_with, and impacts.
+
+    Prioritize relationships between objectives and capabilities, capabilities
+    and requirements, requirements and integrations/data entities/risks/user
+    stories, user stories and acceptance criteria, acceptance criteria and UAT
+    scenarios, constraints and affected requirements, and risks and mitigations.
+    Each relationship must include source_id, source_type, relationship_type,
+    target_id, target_type, a business-specific description, confidence, and
+    source_reference. Assign stable IDs to delivery entities including features,
+    user stories, acceptance criteria, and UAT scenarios.
+
+    Populate process_intelligence, test_intelligence, impact_analysis,
+    executive_translation, and enterprise_intelligence from evidence-supported
+    findings. Enterprise intelligence must identify controls, systems,
+    integrations, data flows, and integration controls where supported.
 
     Refinement mode:
     {refinement_instruction or "This is an initial analysis run."}
@@ -363,7 +409,7 @@ def enforce_orchestration_source_of_truth(
   #  - Assumptions
   #  - Dependencies
   #  - Open questions
-  #  - UAT scenarios
+#  - UAT scenarios
 
 #  Transcript:
   #  {transcript}
