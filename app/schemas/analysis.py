@@ -45,6 +45,7 @@ class SourceFileInput(BaseModel):
      type: Optional[str] = None
      size: Optional[int] = None
      content_base64: Optional[str] = None
+     storage_id: Optional[str] = None
 
 
 class TranscriptRequest(BaseModel):
@@ -52,6 +53,8 @@ class TranscriptRequest(BaseModel):
      transcript: str = ""
      source_text: Optional[str] = None
      project_type: Literal["internal", "external"] = "internal"
+     team_id: Optional[int] = None
+     team_ids: Optional[List[int]] = None
      company_name: Optional[str] = None
      industry: Optional[str] = None
      domain: Optional[str] = None

@@ -1,6 +1,3 @@
-from app.schemas.auth import CurrentUser
-
-
 ROLE_PERMISSIONS = {
     "superadmin": [
         "manage_users",
@@ -10,6 +7,20 @@ ROLE_PERMISSIONS = {
         "edit_artifacts",
         "approve_requirements",
         "view_artifacts",
+        "create_teams",
+        "view_teams",
+        "edit_teams",
+        "archive_projects",
+        "archive_teams",
+        "restore_archives",
+        "manage_access",
+        "create_roles",
+        "manage_password_policy",
+        "manage_identity_providers",
+        "manage_team_members",
+        "assign_project_teams",
+        "view_all_projects",
+        "manage_tenants",
     ],
     "admin": [
         "manage_projects",
@@ -17,22 +28,35 @@ ROLE_PERMISSIONS = {
         "edit_artifacts",
         "approve_requirements",
         "view_artifacts",
+        "create_teams",
+        "view_teams",
+        "edit_teams",
+        "archive_projects",
+        "archive_teams",
+        "create_roles",
+        "manage_password_policy",
+        "manage_identity_providers",
+        "manage_team_members",
+        "assign_project_teams",
+        "view_all_projects",
     ],
     "business_analyst": [
         "create_analysis",
         "edit_artifacts",
         "approve_requirements",
         "view_artifacts",
+        "create_teams",
+        "view_teams",
+        "edit_teams",
+        "manage_team_members",
+        "assign_project_teams",
     ],
-    "viewer": ["view_artifacts"],
+    "viewer": ["view_artifacts", "view_teams"],
 }
 
-
-CURRENT_SUPERADMIN = CurrentUser(
-    id="user-dami-dahunsi",
-    name="Dami Dahunsi",
-    username="damem2007",
-    email="dami@ba-optimization.local",
-    role="superadmin",
-    permissions=ROLE_PERMISSIONS["superadmin"],
-)
+ROLE_DESCRIPTIONS = {
+    "superadmin": "Unrestricted platform administration and governance.",
+    "admin": "Workspace, project, team, and delivery administration.",
+    "business_analyst": "Creates and maintains business analysis artifacts.",
+    "viewer": "Read-only access to authorized teams and artifacts.",
+}

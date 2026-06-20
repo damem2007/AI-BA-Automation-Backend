@@ -1,23 +1,44 @@
-from fastapi import APIRouter, Depends, HTTPException
+import json
+import base64
+import binascii
+import re
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Literal, Optional
 
 from app.database import SessionLocal
-from app.models import AnalysisArtifact, ArtifactVersion
-from app.schemas.analysis import RELATIONSHIP_TYPES, RefinementRequest, TranscriptRequest
+from app.models import AnalysisArtifact, ArtifactVersion, ProjectTeam, Team, TeamMembership
+from app.schemas.auth import CurrentUser
+from app.schemas.analysis import (
+    RELATIONSHIP_TYPES,
+    RefinementRequest,
+    TranscriptRequest,
+)
 from app.services.analysis_context import (
     BA_ACTIVITY_AREAS,
     BABOK_FOCUS_AREAS,
     resolve_activity_recommendations,
 )
 from app.services.ai_service import analyze_transcript
+from app.services.auth import get_current_user, require_permission
+from app.services.analysis_jobs import analysis_jobs
+from app.services.analysis_limits import (
+    public_limits,
+    validate_analysis_request,
+)
 from app.services.export_service import build_export
 from app.services.traceability import build_traceability_matrix as build_canonical_traceability_matrix
+from app.services.source_uploads import (
+    discard_staged_upload,
+    stage_upload,
+    staged_upload_metrics,
+)
 from datetime import datetime, timezone
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 class ExportRequest(BaseModel):
@@ -47,6 +68,65 @@ def unique_preserve_order(values: List[str]) -> List[str]:
             seen.add(value)
             result.append(value)
     return result
+
+
+def incremental_item_key(item) -> str:
+    if isinstance(item, dict):
+        if item.get("source_id") and item.get("relationship_type") and item.get("target_id"):
+            return (
+                f"relationship:{item['source_id']}:{item['relationship_type']}:{item['target_id']}"
+            )
+        for key in ("id", "name", "category", "endpoint_or_interface", "description"):
+            if item.get(key):
+                return f"{key}:{str(item[key]).strip().lower()}"
+    return json.dumps(item, sort_keys=True, default=str)
+
+
+def merge_incremental_value(previous, current):
+    """Preserve established findings while accepting richer refinement evidence."""
+    if isinstance(previous, dict) and isinstance(current, dict):
+        return {
+            key: merge_incremental_value(previous.get(key), current.get(key))
+            if key in previous and key in current
+            else current.get(key, previous.get(key))
+            for key in set(previous) | set(current)
+        }
+    if isinstance(previous, list) and isinstance(current, list):
+        merged = list(previous)
+        positions = {
+            incremental_item_key(item): index
+            for index, item in enumerate(merged)
+        }
+        for item in current:
+            key = incremental_item_key(item)
+            if key in positions:
+                index = positions[key]
+                merged[index] = merge_incremental_value(merged[index], item)
+            else:
+                positions[key] = len(merged)
+                merged.append(item)
+        return merged
+    return previous if current in (None, "", [], {}) else current
+
+
+def preserve_cumulative_intelligence(previous_analysis: dict, updated_analysis: dict) -> dict:
+    cumulative = dict(updated_analysis)
+    for section in (
+        "semantic_model",
+        "delivery_analysis",
+        "process_intelligence",
+        "test_intelligence",
+        "impact_analysis",
+    ):
+        cumulative[section] = merge_incremental_value(
+            (previous_analysis or {}).get(section) or {},
+            (updated_analysis or {}).get(section) or {},
+        )
+    cumulative["entity_relationships"] = merge_incremental_value(
+        canonical_relationships(previous_analysis),
+        canonical_relationships(updated_analysis),
+    )
+    return cumulative
 
 
 def ensure_phase_history(analysis_json: dict, artifact: AnalysisArtifact) -> dict:
@@ -462,11 +542,60 @@ def build_traceability_chains(matrix: list[dict], registry: dict[str, dict]) -> 
     return chains[:100]
 
 
+TRACEABILITY_STOP_WORDS = {
+    "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "is", "of", "on",
+    "or", "that", "the", "this", "to", "with", "system", "shall", "must", "should",
+}
+
+
+def semantic_entity_tokens(entity: dict) -> set[str]:
+    text = f"{entity.get('name') or ''} {entity.get('description') or ''}".lower()
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text)
+        if len(token) > 2 and token not in TRACEABILITY_STOP_WORDS
+    }
+
+
+def reusable_entity_matches(current_registry: dict[str, dict], context_registry: dict[str, dict]) -> list[dict]:
+    matches = []
+    for current in current_registry.values():
+        current_tokens = semantic_entity_tokens(current)
+        if not current_tokens:
+            continue
+        for existing in context_registry.values():
+            if current["type"] != existing["type"]:
+                continue
+            existing_tokens = semantic_entity_tokens(existing)
+            if not existing_tokens:
+                continue
+            intersection = current_tokens & existing_tokens
+            union = current_tokens | existing_tokens
+            similarity = len(intersection) / len(union) if union else 0
+            containment = len(intersection) / min(len(current_tokens), len(existing_tokens))
+            if similarity < 0.5 and containment < 0.75:
+                continue
+            matches.append({
+                "current_id": current["id"],
+                "current_name": current["name"],
+                "existing_id": existing["id"],
+                "existing_name": existing["name"],
+                "entity_type": current["type"],
+                "similarity": round(max(similarity, containment), 2),
+                "match_reason": f"Shared business concepts: {', '.join(sorted(intersection)[:6])}",
+                "current_source_reference": current.get("source_reference") or "",
+                "existing_source_reference": existing.get("source_reference") or "",
+            })
+    return sorted(matches, key=lambda item: item["similarity"], reverse=True)[:20]
+
+
 def serialize_artifact_response(
     artifact: AnalysisArtifact,
     analysis_json: dict,
     selected_phase: Optional[int] = None,
+    db: Optional[Session] = None,
 ) -> dict:
+    teams = artifact_team_summaries(db, artifact.id) if db else []
     return {
         "id": artifact.id,
         "project_name": artifact.project_name,
@@ -484,11 +613,33 @@ def serialize_artifact_response(
         "selected_outputs": artifact.selected_outputs,
         "source_files": artifact.source_files,
         "country": artifact.country,
+        "team_id": artifact.team_id,
+        "owner_user_id": artifact.owner_user_id,
+        "is_archived": artifact.is_archived,
+        "teams": teams,
         "analysis": analysis_json,
         "current_version_id": artifact.current_version_id,
         "selected_phase": selected_phase or get_analysis_phase(analysis_json),
         "created_at": artifact.created_at,
     }
+
+
+def artifact_team_summaries(db: Session, artifact_id: int) -> list[dict]:
+    teams = db.query(Team).join(ProjectTeam, ProjectTeam.team_id == Team.id).filter(
+        ProjectTeam.artifact_id == artifact_id,
+        Team.is_archived.is_(False),
+    ).order_by(Team.name.asc()).all()
+    palette = ["#147d92", "#7c3aed", "#b45309", "#047857", "#be123c", "#3f6212"]
+    icons = ["users", "blocks", "workflow", "layers", "briefcase", "network"]
+    return [
+        {
+            "id": team.id,
+            "name": team.name,
+            "color": palette[team.id % len(palette)],
+            "icon": icons[team.id % len(icons)],
+        }
+        for team in teams
+    ]
 
 def get_db():
     db = SessionLocal()
@@ -497,9 +648,75 @@ def get_db():
     finally:
         db.close()
 
-@router.post("/analyze-source-materials")
-@router.post("/analyze")
-def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
+
+def accessible_artifacts_query(
+    db: Session,
+    user: CurrentUser,
+    include_archived: bool = False,
+):
+    query = db.query(AnalysisArtifact).filter(AnalysisArtifact.is_deleted.is_(False))
+    if not include_archived:
+        query = query.filter(AnalysisArtifact.is_archived.is_(False))
+    if not user.is_global:
+        query = query.filter(AnalysisArtifact.tenant_id == user.tenant_id)
+    if not user.is_global and "view_all_projects" not in user.permissions:
+        team_ids = db.query(TeamMembership.team_id).filter(TeamMembership.user_id == user.id)
+        project_ids = db.query(ProjectTeam.artifact_id).filter(ProjectTeam.team_id.in_(team_ids))
+        query = query.filter(
+            (AnalysisArtifact.owner_user_id == user.id)
+            | (AnalysisArtifact.id.in_(project_ids))
+        )
+    return query
+
+
+def get_accessible_artifact(
+    db: Session,
+    artifact_id: int,
+    user: CurrentUser,
+    include_archived: bool = False,
+) -> AnalysisArtifact:
+    artifact = accessible_artifacts_query(db, user, include_archived).filter(
+        AnalysisArtifact.id == artifact_id
+    ).first()
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return artifact
+
+
+def validate_team_assignment(db: Session, team_ids: list[int], user: CurrentUser) -> list[Team]:
+    if not team_ids:
+        return []
+    teams = db.query(Team).filter(
+        Team.id.in_(team_ids),
+        Team.tenant_id == user.tenant_id,
+        Team.is_archived.is_(False),
+    ).all()
+    if {team.id for team in teams} != set(team_ids):
+        raise HTTPException(status_code=422, detail="One or more selected teams are not available")
+    for team in teams:
+        if not team.allow_multiple_projects and db.query(ProjectTeam).filter(
+            ProjectTeam.team_id == team.id
+        ).first():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{team.name} is limited to one project. Enable multi-project work in Team settings.",
+            )
+    if user.is_global:
+        return teams
+    member_team_ids = {
+        value[0]
+        for value in db.query(TeamMembership.team_id).filter(
+            TeamMembership.user_id == user.id,
+            TeamMembership.team_id.in_(team_ids),
+        ).all()
+    }
+    if member_team_ids != set(team_ids):
+        raise HTTPException(status_code=403, detail="Selected team access is required")
+    return teams
+
+
+def run_initial_analysis(request: TranscriptRequest, db: Session, actor: CurrentUser):
+    validate_analysis_request(request)
     source_text = request.source_text if request.source_text is not None else request.transcript
 
     try:
@@ -530,10 +747,16 @@ def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
             source_subtype=request.source_subtype,
         )
     except Exception as error:
+        for source_file in request.source_files or []:
+            if source_file.storage_id:
+                discard_staged_upload(source_file.storage_id)
         raise HTTPException(
             status_code=502,
             detail=f"Analysis service failed: {error}",
         ) from error
+    for source_file in request.source_files or []:
+        if source_file.storage_id:
+            discard_staged_upload(source_file.storage_id)
     analysis_payload = enrich_relationships(analysis.model_dump())
     initial_orchestration = analysis_payload.setdefault("analysis_orchestration", {})
     # Initial analysis is recorded as phase one so artifact refinement has a visible BABOK breadcrumb.
@@ -557,6 +780,7 @@ def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
     )
     initial_orchestration.setdefault("rerun_warnings", [])
 
+    selected_team_ids = list(dict.fromkeys(request.team_ids or ([request.team_id] if request.team_id else [])))
     artifact = AnalysisArtifact(
         project_name=request.project_name,
         project_type=request.project_type,
@@ -581,9 +805,15 @@ def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
         ],
         country=request.country,
         transcript=source_text,
-        analysis_json=analysis_payload
+        analysis_json=analysis_payload,
+        owner_user_id=actor.id,
+        team_id=selected_team_ids[0] if selected_team_ids else None,
+        tenant_id=actor.tenant_id,
     )
     db.add(artifact)
+    db.flush()
+    for team_id in selected_team_ids:
+        db.add(ProjectTeam(artifact_id=artifact.id, team_id=team_id, tenant_id=actor.tenant_id, assigned_by=actor.id))
     db.commit()
     db.refresh(artifact)
     artifact.analysis_json = {
@@ -592,6 +822,7 @@ def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
     }
     initial_version = ArtifactVersion(
         artifact_id=artifact.id,
+        tenant_id=artifact.tenant_id,
         analysis_json=artifact.analysis_json,
         version_type="initial",
         is_active=True,
@@ -625,12 +856,112 @@ def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(artifact)
 
-    return serialize_artifact_response(artifact, artifact.analysis_json, 1)
+    return serialize_artifact_response(artifact, artifact.analysis_json, 1, db)
+
+
+def stage_request_source_files(request: TranscriptRequest) -> tuple[TranscriptRequest, list[str]]:
+    """Replace base64 request payloads with bounded RAM references before queueing."""
+    staged_ids = []
+    staged_files = []
+    try:
+        for source_file in request.source_files or []:
+            if not source_file.content_base64:
+                staged_files.append(source_file)
+                continue
+            try:
+                content = base64.b64decode(source_file.content_base64, validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{source_file.name} contains invalid base64 content.",
+                ) from error
+            storage_id = stage_upload(content)
+            staged_ids.append(storage_id)
+            staged_files.append(
+                source_file.model_copy(
+                    update={
+                        "size": len(content),
+                        "content_base64": None,
+                        "storage_id": storage_id,
+                    }
+                )
+            )
+    except Exception:
+        for storage_id in staged_ids:
+            discard_staged_upload(storage_id)
+        raise
+    return request.model_copy(update={"source_files": staged_files}, deep=True), staged_ids
+
+
+@router.post("/analyze-source-materials")
+@router.post("/analyze")
+def analyze(request: TranscriptRequest, db: Session = Depends(get_db)):
+    # Compatibility endpoint. New clients should use the background generate + poll API.
+    raise HTTPException(status_code=410, detail="Use /analyze/generate for authenticated analysis jobs")
+
+
+@router.post("/analyze/generate", status_code=status.HTTP_202_ACCEPTED)
+def generate_analysis(
+    request: TranscriptRequest,
+    http_request: Request,
+    user: CurrentUser = Depends(require_permission("create_analysis")),
+    db: Session = Depends(get_db),
+):
+    validate_analysis_request(request)
+    selected_team_ids = list(dict.fromkeys(request.team_ids or ([request.team_id] if request.team_id else [])))
+    validate_team_assignment(db, selected_team_ids, user)
+    client_host = http_request.client.host if http_request.client else "unknown"
+    client_key = f"{user.tenant_id}:{user.subject}:{client_host}"
+    request_snapshot, staged_ids = stage_request_source_files(request)
+
+    def work():
+        db = SessionLocal()
+        try:
+            return run_initial_analysis(request_snapshot, db, user)
+        finally:
+            db.close()
+
+    try:
+        job = analysis_jobs.submit(
+            client_key,
+            work,
+            owner_subject=user.subject,
+            tenant_id=user.tenant_id,
+        )
+    except Exception:
+        for storage_id in staged_ids:
+            discard_staged_upload(storage_id)
+        raise
+    return {**job, "status_url": f"/analyze/jobs/{job['job_id']}"}
+
+
+@router.get("/analyze/jobs/{job_id}")
+def get_analysis_job(job_id: str, user: CurrentUser = Depends(get_current_user)):
+    job = analysis_jobs.get(job_id)
+    if user.role != "superadmin" and (
+        job.get("owner_subject") != user.subject or job.get("tenant_id") != user.tenant_id
+    ):
+        raise HTTPException(status_code=404, detail="Analysis job not found")
+    return job
+
+
+@router.get("/analyze/jobs")
+def get_analysis_job_metrics(_: CurrentUser = Depends(require_permission("manage_projects"))):
+    return analysis_jobs.metrics()
+
+
+@router.get("/analysis-config/limits")
+def get_analysis_limits():
+    return {**public_limits(), **analysis_jobs.metrics(), **staged_upload_metrics()}
+
 
 @router.get("/analysis-artifacts")
-def get_artifacts(db: Session = Depends(get_db)):
+def get_artifacts(
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
+    db: Session = Depends(get_db),
+):
     artifacts = (
-        db.query(AnalysisArtifact)
+        accessible_artifacts_query(db, user)
         .order_by(AnalysisArtifact.created_at.desc())
         .all()
     )
@@ -652,6 +983,10 @@ def get_artifacts(db: Session = Depends(get_db)):
             "selected_outputs": artifact.selected_outputs,
             "source_files": artifact.source_files,
             "country": artifact.country,
+            "team_id": artifact.team_id,
+            "owner_user_id": artifact.owner_user_id,
+            "is_archived": artifact.is_archived,
+            "teams": artifact_team_summaries(db, artifact.id),
             "created_at": artifact.created_at,
         }
         for artifact in artifacts
@@ -659,8 +994,11 @@ def get_artifacts(db: Session = Depends(get_db)):
 
 
 @router.get("/analysis-artifacts-overview")
-def get_artifacts_overview(db: Session = Depends(get_db)):
-    artifacts = db.query(AnalysisArtifact).order_by(AnalysisArtifact.created_at.desc()).all()
+def get_artifacts_overview(
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
+    db: Session = Depends(get_db),
+):
+    artifacts = accessible_artifacts_query(db, user).order_by(AnalysisArtifact.created_at.desc()).all()
     versions = db.query(ArtifactVersion).all()
     total_requirements = 0
     total_risks = 0
@@ -723,19 +1061,14 @@ def get_activity_recommendations(request: ActivityRecommendationRequest):
 def get_artifact(
     artifact_id: int,
     phase: Optional[str] = None,
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
     db: Session = Depends(get_db),
 ):
-    artifact = (
-        db.query(AnalysisArtifact)
-        .filter(AnalysisArtifact.id == artifact_id)
-        .first()
-    )
-    if not artifact:
-        return {"error": "Artifact not found"}
+    artifact = get_accessible_artifact(db, artifact_id, user)
 
     selected_analysis, selected_phase = find_analysis_for_phase(artifact, phase, db)
     
-    response = serialize_artifact_response(artifact, selected_analysis, selected_phase)
+    response = serialize_artifact_response(artifact, selected_analysis, selected_phase, db)
     response["transcript"] = artifact.transcript
     return response
 
@@ -744,16 +1077,10 @@ def get_artifact(
 def refine_artifact(
     artifact_id: int,
     request: RefinementRequest,
+    user: CurrentUser = Depends(require_permission("edit_artifacts")),
     db: Session = Depends(get_db),
 ):
-    artifact = (
-        db.query(AnalysisArtifact)
-        .filter(AnalysisArtifact.id == artifact_id)
-        .first()
-    )
-
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = get_accessible_artifact(db, artifact_id, user)
 
     if (
         request.current_version_id is not None
@@ -775,6 +1102,7 @@ def refine_artifact(
     if previous_history and not previous_history[-1].get("version_id"):
         baseline_snapshot = ArtifactVersion(
             artifact_id=artifact.id,
+            tenant_id=artifact.tenant_id,
             analysis_json=previous_analysis,
             version_type="phase_snapshot",
             is_active=False,
@@ -867,12 +1195,22 @@ def refine_artifact(
             refinement_instruction=refinement_instruction,
         )
     except Exception as error:
+        for source_file in request.source_files or []:
+            if source_file.storage_id:
+                discard_staged_upload(source_file.storage_id)
         raise HTTPException(
             status_code=502,
             detail=f"Refinement service failed: {error}",
         ) from error
+    for source_file in request.source_files or []:
+        if source_file.storage_id:
+            discard_staged_upload(source_file.storage_id)
 
-    updated_analysis = enrich_relationships(analysis.model_dump())
+    updated_analysis = preserve_cumulative_intelligence(
+        previous_analysis,
+        analysis.model_dump(),
+    )
+    updated_analysis = enrich_relationships(updated_analysis)
     orchestration = updated_analysis.setdefault("analysis_orchestration", {})
     history = list(previous_orchestration.get("activity_run_history") or [])
     phase = len(history) + 1
@@ -923,6 +1261,7 @@ def refine_artifact(
 
     new_version = ArtifactVersion(
         artifact_id=artifact.id,
+        tenant_id=artifact.tenant_id,
         analysis_json=updated_analysis,
         version_type="refinement",
         is_active=True,
@@ -952,23 +1291,17 @@ def refine_artifact(
 
     return {
         "message": "Artifact refinement completed successfully",
-        "artifact": serialize_artifact_response(artifact, artifact.analysis_json, phase),
+        "artifact": serialize_artifact_response(artifact, artifact.analysis_json, phase, db),
     }
 
 @router.post("/analysis-artifacts/{artifact_id}/export")
 def export_artifact(
     artifact_id: int,
     request: ExportRequest,
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
     db: Session = Depends(get_db),
 ):
-    artifact = (
-        db.query(AnalysisArtifact)
-        .filter(AnalysisArtifact.id == artifact_id)
-        .first()
-    )
-
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = get_accessible_artifact(db, artifact_id, user)
 
     try:
         content, filename, media_type = build_export(
@@ -994,8 +1327,10 @@ def get_artifact_versions(
     page: int = 1,
     page_size: int = 20,
     phase: Optional[int] = None,
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
     db: Session = Depends(get_db),
 ):
+    get_accessible_artifact(db, artifact_id, user)
     page = max(page, 1)
     page_size = min(max(page_size, 1), 100)
     offset = (page - 1) * page_size
@@ -1048,8 +1383,10 @@ def compare_artifact_versions(
     artifact_id: int,
     from_version_id: Optional[int] = None,
     to_version_id: Optional[int] = None,
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
     db: Session = Depends(get_db),
 ):
+    get_accessible_artifact(db, artifact_id, user)
     versions = (
         db.query(ArtifactVersion)
         .filter(ArtifactVersion.artifact_id == artifact_id)
@@ -1083,8 +1420,10 @@ def compare_artifact_versions(
 def get_artifact_version(
     artifact_id: int,
     version_id: int,
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
     db: Session = Depends(get_db)
 ):
+    get_accessible_artifact(db, artifact_id, user)
     version = (
         db.query(ArtifactVersion)
         .filter(
@@ -1109,10 +1448,12 @@ def get_artifact_version(
 
 
 @router.get("/analysis-artifacts/{artifact_id}/traceability")
-def get_artifact_traceability(artifact_id: int, db: Session = Depends(get_db)):
-    artifact = db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+def get_artifact_traceability(
+    artifact_id: int,
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
+    db: Session = Depends(get_db),
+):
+    artifact = get_accessible_artifact(db, artifact_id, user)
 
     analysis = artifact.analysis_json or {}
     registry = entity_registry(analysis)
@@ -1140,6 +1481,50 @@ def get_artifact_traceability(artifact_id: int, db: Session = Depends(get_db)):
         source = node.get("source_reference") or "No source reference"
         source_links.setdefault(source, []).append(node["id"])
 
+    # Reusable evidence is projected only when canonical entities overlap semantically.
+    context_palette = ["#147d92", "#7c3aed", "#b45309", "#047857", "#be123c", "#3f6212"]
+    context_artifacts = accessible_artifacts_query(db, user).filter(
+        AnalysisArtifact.id != artifact_id
+    ).order_by(AnalysisArtifact.created_at.desc()).limit(20).all()
+    existing_project_context = []
+    for context_artifact in context_artifacts:
+        context_analysis = context_artifact.analysis_json or {}
+        context_registry = entity_registry(context_analysis)
+        context_relationships = canonical_relationships(context_analysis)
+        shared_entities = reusable_entity_matches(registry, context_registry)
+        if not shared_entities:
+            continue
+        matched_existing_ids = {match["existing_id"] for match in shared_entities}
+        relationship_evidence = []
+        for relationship in context_relationships:
+            if not ({relationship["source_id"], relationship["target_id"]} & matched_existing_ids):
+                continue
+            relationship_evidence.append({
+                **relationship,
+                "source_name": context_registry.get(relationship["source_id"], {}).get("name", relationship["source_id"]),
+                "target_name": context_registry.get(relationship["target_id"], {}).get("name", relationship["target_id"]),
+            })
+        color = context_palette[len(existing_project_context) % len(context_palette)]
+        entity_types = sorted({match["entity_type"].replace("_", " ") for match in shared_entities})
+        existing_project_context.append(
+            {
+                "project_id": context_artifact.id,
+                "project_name": context_artifact.project_name,
+                "source_color": color,
+                "source_files": context_artifact.source_files or [],
+                "link_summary": (
+                    f"{len(shared_entities)} reusable canonical alignment"
+                    f"{'s' if len(shared_entities) != 1 else ''} across {', '.join(entity_types)}."
+                ),
+                "shared_entities": shared_entities,
+                "relationship_evidence": relationship_evidence[:20],
+                "reuse_guidance": [
+                    "Validate matched evidence against the current project's source material before reuse.",
+                    "Reuse confirmed controls, tests, and dependency paths where the linked requirement remains equivalent.",
+                ],
+            }
+        )
+
     return {
         "artifact_id": artifact_id,
         "nodes": nodes,
@@ -1151,6 +1536,7 @@ def get_artifact_traceability(artifact_id: int, db: Session = Depends(get_db)):
             {"source_reference": source, "entity_ids": entity_ids}
             for source, entity_ids in source_links.items()
         ],
+        "existing_project_context": existing_project_context,
         "coverage": {
             "total_entities": len(nodes),
             "linked_entities": len([node for node in nodes if node["id"] in linked_ids]),
@@ -1160,29 +1546,35 @@ def get_artifact_traceability(artifact_id: int, db: Session = Depends(get_db)):
                 [node for node in nodes if node.get("source_reference")]
             ),
         },
-        "intelligence": {
-            "process": analysis.get("process_intelligence") or {},
-            "test": analysis.get("test_intelligence") or {},
-            "impact": analysis.get("impact_analysis") or {},
-            "executive_translation": analysis.get("executive_translation") or {},
-            "enterprise": analysis.get("enterprise_intelligence") or {},
-        },
+    }
+
+
+@router.get("/analysis-artifacts/{artifact_id}/intelligence")
+def get_artifact_intelligence(
+    artifact_id: int,
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
+    db: Session = Depends(get_db),
+):
+    artifact = get_accessible_artifact(db, artifact_id, user)
+
+    analysis = artifact.analysis_json or {}
+    return {
+        "artifact_id": artifact_id,
+        "process_intelligence": analysis.get("process_intelligence") or {},
+        "test_intelligence": analysis.get("test_intelligence") or {},
+        "impact_analysis": analysis.get("impact_analysis") or {},
+        "executive_translation": analysis.get("executive_translation") or {},
+        "enterprise_intelligence": analysis.get("enterprise_intelligence") or {},
     }
 
 @router.post("/analysis-artifacts/{artifact_id}/versions/{version_id}/restore")
 def restore_artifact_version(
     artifact_id: int,
     version_id: int,
+    user: CurrentUser = Depends(require_permission("edit_artifacts")),
     db: Session = Depends(get_db)
 ):
-    artifact = (
-        db.query(AnalysisArtifact)
-        .filter(AnalysisArtifact.id == artifact_id)
-        .first()
-    )
-
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = get_accessible_artifact(db, artifact_id, user)
 
     version = (
         db.query(ArtifactVersion)
@@ -1198,6 +1590,7 @@ def restore_artifact_version(
     
     current_snapshot = ArtifactVersion(
         artifact_id=artifact.id,
+        tenant_id=artifact.tenant_id,
         analysis_json=artifact.analysis_json,
         version_type="pre_restore_snapshot",
         is_active=False,
@@ -1245,22 +1638,17 @@ def restore_artifact_version(
 def update_artifact(
     artifact_id: int,
     updated_analysis: dict,
+    user: CurrentUser = Depends(require_permission("edit_artifacts")),
     db: Session = Depends(get_db)
 ):
-    artifact = (
-        db.query(AnalysisArtifact)
-        .filter(AnalysisArtifact.id == artifact_id)
-        .first()
-    )
-
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = get_accessible_artifact(db, artifact_id, user)
 
     updated_analysis = enrich_relationships(updated_analysis)
     updated_phase = get_analysis_phase(updated_analysis)
     artifact_head_phase = get_analysis_phase(artifact.analysis_json or {})
     new_version = ArtifactVersion(
         artifact_id=artifact.id,
+        tenant_id=artifact.tenant_id,
         analysis_json=updated_analysis,
         version_type="update",
         is_active=updated_phase == artifact_head_phase,
@@ -1287,5 +1675,6 @@ def update_artifact(
             artifact,
             updated_analysis if updated_phase != artifact_head_phase else artifact.analysis_json,
             updated_phase,
+            db,
         ),
     }

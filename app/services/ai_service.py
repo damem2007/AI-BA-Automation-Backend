@@ -11,6 +11,7 @@ from app.services.analysis_context import (
     build_orchestration_context,
     build_source_intent_prompt,
 )
+from app.services.multimodal_sources import prepare_source_files_for_analysis
 from app.services.source_materials import build_source_bundle, build_source_context
 
 load_dotenv()
@@ -47,8 +48,9 @@ def analyze_transcript(
     refinement_instruction: Optional[str] = None,
 ) -> CBAKFAnalysisOutput:
    # Build canonical context before prompting so UI orchestration drives analysis.
-   source_bundle = build_source_bundle(source_text, source_files)
-   source_context = build_source_context(source_text, source_files, source_intent=source_intent,
+   prepared_source_files = prepare_source_files_for_analysis(source_files, client)
+   source_bundle = build_source_bundle(source_text, prepared_source_files)
+   source_context = build_source_context(source_text, prepared_source_files, source_intent=source_intent,
     source_subtype=source_subtype,)
    source_material_types = [
        str(item.get("type"))
@@ -154,6 +156,18 @@ def analyze_transcript(
                 facts from assumptions. Do not invent missing requirements,
                 fields, stakeholders, integrations, or process steps.
 
+                Uploaded modalities are preprocessed into normalized evidence.
+                Treat extracted content, extraction method, content hash, and
+                source_reference as authoritative evidence provenance. A prior
+                source marked metadata-only is context, not evidence. Do not
+                infer facts from a filename or media type alone.
+
+                Produce stable canonical entities for the same evidence. Reuse
+                prior canonical IDs during refinement, prefer the most specific
+                evidence-supported classification, and order equivalent findings
+                by source_reference then entity ID. Ignore timestamps when
+                determining semantic meaning.
+
                 Normalize entities, classify requirements correctly, avoid
                 duplicate requirements, preserve source truth, and keep action
                 points separate from decisions, open questions, tasks, and
@@ -198,6 +212,7 @@ def analyze_transcript(
             }
         ],
         response_format=CBAKFAnalysisOutput,
+        temperature=0,
    )
    if not completion.choices:
        raise ValueError("OpenAI API returned no completion choices")
@@ -339,6 +354,14 @@ def build_context_prompt(
     integration contract, business rule, exception path, role/permission need,
     data validation rule, boundary condition, and failure mode without inventing
     unsupported scope or duplicating equivalent findings.
+    Functional requirements must cover every supported workflow step, system
+    action, approval, calculation, validation, exception, notification, report,
+    reconciliation, data transformation, integration, and operational handoff.
+    Non-functional requirements must assess performance, capacity, availability,
+    resilience, recovery, security, privacy, accessibility, usability,
+    auditability, observability, maintainability, interoperability, retention,
+    residency, scalability, and supportability wherever relevant. Use measurable
+    targets only when supported; otherwise add a validation question.
 
     For impact_analysis, translate the change or source material into impacted
     systems, workflows, integrations, reports, data entities, roles, controls,
@@ -378,6 +401,10 @@ def build_context_prompt(
     If this is a refinement run, preserve still-valid prior findings, improve
     or expand weak areas, add new evidence-supported findings, and avoid
     discarding previous semantic entities unless the source or refinement
+    explicitly corrects them. Entity relationships, process intelligence, test
+    intelligence, and impact analysis are cumulative: optimize and deepen them
+    incrementally, never reduce their quality because a later phase has a
+    narrower focus.
     context clearly supersedes them.
 
     Strategic analysis enabled: {str(strategic_enabled).lower()}

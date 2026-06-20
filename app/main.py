@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes.analyze import router as analyze_router
 from app.routes.auth import router as auth_router
+from app.routes.management import settings_router, teams_router
+from app.services.auth import ensure_local_identity
 
 
 load_dotenv()
@@ -34,6 +36,13 @@ app.add_middleware(
 
 app.include_router(analyze_router)
 app.include_router(auth_router)
+app.include_router(teams_router)
+app.include_router(settings_router)
+
+
+@app.on_event("startup")
+def initialize_local_identity():
+    ensure_local_identity()
 
 @app.get("/")
 

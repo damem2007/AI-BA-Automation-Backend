@@ -1,0 +1,51 @@
+import os
+import smtplib
+from email.message import EmailMessage
+
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+
+def send_email(recipient: str, subject: str, body: str) -> bool:
+    """Send transactional onboarding mail when SMTP is configured; never persist credentials."""
+    host = os.getenv("SMTP_HOST", "")
+    sender = os.getenv("SMTP_FROM", "")
+    if not host or not sender:
+        return False
+    port = int(os.getenv("SMTP_PORT", "587"))
+    username = os.getenv("SMTP_USERNAME", "")
+    password = os.getenv("SMTP_PASSWORD", "")
+    use_tls = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = recipient
+    message["Subject"] = subject
+    message.set_content(body)
+    with smtplib.SMTP(host, port, timeout=20) as client:
+        if use_tls:
+            client.starttls()
+        if username:
+            client.login(username, password)
+        client.send_message(message)
+    return True
+
+
+def send_local_onboarding(recipient: str, name: str, reset_url: str) -> bool:
+    return send_email(
+        recipient,
+        "Welcome to BA Optimization",
+        f"Hello {name},\n\nYour local BA Optimization account is ready. "
+        f"Set your password using this one-time link:\n{reset_url}\n\n"
+        "If you did not expect this invitation, contact your workspace administrator.",
+    )
+
+
+def send_sso_onboarding(recipient: str, name: str, provider_name: str) -> bool:
+    return send_email(
+        recipient,
+        "BA Optimization SSO access",
+        f"Hello {name},\n\nYour BA Optimization account was synchronized for tenant access. "
+        f"Use your {provider_name} enterprise sign-in. No local password is required.",
+    )

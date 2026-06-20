@@ -6,6 +6,8 @@ from zipfile import BadZipFile, ZipFile
 from xml.etree import ElementTree
 from pypdf import PdfReader
 
+from app.services.analysis_limits import MAX_EXTRACTED_CHARS_PER_FILE
+from app.services.source_uploads import read_staged_upload
 
 TEXT_EXTENSIONS = {".txt", ".csv", ".md", ".rtf", ".bpmn", ".xml"}
 DOCX_EXTENSIONS = {".docx"}
@@ -14,14 +16,17 @@ PDF_EXTENSIONS = {".pdf"}
 # File types become source-context metadata even when text extraction is not possible.
 SOURCE_TYPE_BY_EXTENSION = {
     ".mp3": "audio",
-    ".aac": "audio",
+    ".mp4": "audio",
+    ".mpeg": "audio",
+    ".mpga": "audio",
     ".wav": "audio",
     ".m4a": "audio",
+    ".webm": "audio",
     ".png": "image",
     ".jpg": "image",
     ".jpeg": "image",
-    ".bmp": "image",
-    ".bitmap": "image",
+    ".webp": "image",
+    ".gif": "image",
     ".svg": "image",
     ".bpmn": "bpm",
     ".vsdx": "visio",
@@ -85,33 +90,50 @@ def build_source_context(
         size = int(source_file.get("size") or 0)
         extension = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
         source_type = classify_source_type(name, media_type)
-        has_embedded_content = bool(source_file.get("content_base64"))
-        extracted_text = ""
+        has_embedded_content = bool(source_file.get("content_base64") or source_file.get("storage_id"))
+        extracted_text = str(source_file.get("extracted_text") or "")
+        extraction_method = str(source_file.get("extraction_method") or "")
 
-        if has_embedded_content:
+        if has_embedded_content and not extraction_method:
             try:
-                content = base64.b64decode(str(source_file.get("content_base64")))
+                content = source_file_content(source_file)
                 extracted_text = extract_file_text(content, extension, media_type)
             except ValueError:
                 extracted_text = ""
+            extraction_method = "local_text" if extracted_text else "unsupported_or_unreadable"
+
+        extraction_status = "metadata_only"
+        if extracted_text:
+            extraction_status = (
+                "text_extracted"
+                if extraction_method == "local_text"
+                else "multimodal_extracted"
+            )
+        elif extraction_method == "unsupported_or_unreadable":
+            extraction_status = "unsupported_or_unreadable"
+
+        metadata = [
+            {"key": "media_type", "value": media_type},
+            {"key": "size_bytes", "value": str(size)},
+            {"key": "extension", "value": extension},
+            {
+                "key": "has_embedded_content",
+                "value": str(has_embedded_content).lower(),
+            },
+            {"key": "extraction_status", "value": extraction_status},
+        ]
+        if extraction_method:
+            metadata.append({"key": "extraction_method", "value": extraction_method})
+        if source_file.get("content_sha256"):
+            metadata.append(
+                {"key": "content_sha256", "value": str(source_file["content_sha256"])}
+            )
 
         source_materials.append(
             {
                 "type": source_type,
                 "name": name,
-                "metadata": [
-                    {"key": "media_type", "value": media_type},
-                    {"key": "size_bytes", "value": str(size)},
-                    {"key": "extension", "value": extension},
-                    {
-                        "key": "has_embedded_content",
-                        "value": str(has_embedded_content).lower(),
-                    },
-                    {
-                        "key": "extraction_status",
-                        "value": "text_extracted" if extracted_text else "metadata_only",
-                    },
-                ],
+                "metadata": metadata,
                 "source_reference": f"source:file:{index}",
             }
         )
@@ -156,14 +178,25 @@ def describe_source_file(source_file: Dict[str, object]) -> str:
     size = source_file.get("size") or 0
     extension = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
     content_base64 = source_file.get("content_base64")
+    storage_id = source_file.get("storage_id")
 
     header = f"File: {name}\nType: {media_type}\nSize: {size} bytes"
+    prepared_text = str(source_file.get("extracted_text") or "")
+    extraction_method = str(source_file.get("extraction_method") or "")
 
-    if not isinstance(content_base64, str) or not content_base64:
-        return header + "\nExtracted content: No embedded file content provided."
+    if prepared_text:
+        return (
+            header
+            + f"\nExtraction method: {extraction_method or 'prepared_evidence'}"
+            + "\nExtracted content:\n"
+            + truncate_text(prepared_text)
+        )
+
+    if not storage_id and (not isinstance(content_base64, str) or not content_base64):
+        return header + "\nExtraction status: Prior-source metadata only; no file bytes provided."
 
     try:
-        content = base64.b64decode(content_base64)
+        content = source_file_content(source_file)
     except ValueError:
         return header + "\nExtracted content: Could not decode file payload."
 
@@ -172,13 +205,19 @@ def describe_source_file(source_file: Dict[str, object]) -> str:
     if extracted_text:
         return header + "\nExtracted content:\n" + truncate_text(extracted_text)
 
-    # Binary files still inform the model through type/name and follow-up extraction needs.
     return (
         header
-        + "\nExtracted content: Binary or media source. Use filename, type, and "
-        "project context and other extracted sources as context. Flag OCR/transcription needs as "
-        "AI recommendation notes or open questions."
+        + f"\nExtraction method: {extraction_method or 'unsupported_or_unreadable'}"
+        + "\nExtraction status: No reliable evidence could be extracted. "
+        "Do not infer facts from the filename alone; flag the source for follow-up."
     )
+
+
+def source_file_content(source_file: Dict[str, object]) -> bytes:
+    storage_id = source_file.get("storage_id")
+    if isinstance(storage_id, str) and storage_id:
+        return read_staged_upload(storage_id)
+    return base64.b64decode(str(source_file.get("content_base64") or ""))
 
 
 def extract_file_text(content: bytes, extension: str, media_type: str) -> str:
@@ -271,7 +310,7 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", value).strip()
 
 
-def truncate_text(value: str, limit: int = 12000) -> str:
+def truncate_text(value: str, limit: int = MAX_EXTRACTED_CHARS_PER_FILE) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "\n[Content truncated for prompt size.]"
