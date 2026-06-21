@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-06-20 - Project identity and resilient onboarding
+
+### Added
+
+- Tenant-unique project codes supplied during analysis creation or generated securely for API clients.
+- Persisted project avatar initials and color, returned by artifact, overview, archive, team, mapping,
+  version-restore, and traceability projections.
+- Pending-onboarding resend endpoint for local reset links and SSO instructions.
+- Single-active-token enforcement when issuing or resending password-reset invitations.
+- Migration `f2b7d901e753` for project identity and avatar metadata.
+
+### Changed
+
+- SMTP delivery failures no longer roll back account creation; onboarding remains
+  `email_pending_configuration` and can be retried.
+
+### Verified
+
+- The isolated governance fixture verifies onboarding status, resend behavior, active-token count,
+  and project identity data in team mapping.
+
 ## 2026-06-20 - Tenant governance, hybrid identity, and project access
 
 ### Added

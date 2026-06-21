@@ -15,9 +15,13 @@ class Tenant(Base):
 
 class AnalysisArtifact(Base):
     __tablename__ = "analysis_artifacts"
+    __table_args__ = (UniqueConstraint("tenant_id", "project_code", name="uq_artifact_tenant_project_code"),)
 
     id = Column(Integer, primary_key=True, index=True)
     project_name = Column(String, nullable=False)
+    project_code = Column(String, nullable=False, index=True)
+    avatar_initials = Column(String, nullable=False)
+    avatar_color = Column(String, nullable=False)
     project_type = Column(String, nullable=False, default="internal", server_default="internal")
     company_name = Column(String, nullable=True)
     industry = Column(String, nullable=True)

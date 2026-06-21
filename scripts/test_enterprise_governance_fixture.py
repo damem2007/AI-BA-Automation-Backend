@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from app.database import Base, SessionLocal, engine
 from app.main import app
-from app.models import AnalysisArtifact
+from app.models import AnalysisArtifact, PasswordResetToken
 from app.routes.analyze import reusable_entity_matches
 
 
@@ -37,6 +37,9 @@ def create_project(name: str, owner_user_id: str) -> int:
     try:
         project = AnalysisArtifact(
             project_name=name,
+            project_code="".join(character for character in name.upper() if character.isalnum())[:12],
+            avatar_initials="".join(word[0] for word in name.split()[:2]).upper(),
+            avatar_color="#2563EB",
             project_type="internal",
             transcript="Fixture source",
             analysis_json={"semantic_model": {}},
@@ -96,6 +99,22 @@ def run_fixture() -> None:
             200,
             "create viewer",
         )
+        assert viewer["onboarding_status"] == "email_pending_configuration"
+        resend = expect(
+            client.post(f"/settings/users/{viewer['id']}/resend-onboarding", headers=root_headers),
+            200,
+            "resend pending onboarding",
+        )
+        assert resend["delivered"] is False
+        token_db = SessionLocal()
+        try:
+            active_tokens = token_db.query(PasswordResetToken).filter(
+                PasswordResetToken.user_id == viewer["id"],
+                PasswordResetToken.used_at.is_(None),
+            ).count()
+            assert active_tokens == 1
+        finally:
+            token_db.close()
         expect(
             client.put(
                 f"/teams/{alpha['id']}/members",
@@ -110,6 +129,7 @@ def run_fixture() -> None:
         hidden_project_id = create_project("Hidden Fixture Project", root_login["user"]["id"])
         mapping = expect(client.get("/settings/project-team-mapping", headers=root_headers), 200, "mapping list")
         assert {item["id"] for item in mapping["projects"]} == {assigned_project_id, hidden_project_id}
+        assert all(item["project_code"] and item["avatar_color"] for item in mapping["projects"])
 
         expect(
             client.put(

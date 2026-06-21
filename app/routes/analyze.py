@@ -36,6 +36,11 @@ from app.services.source_uploads import (
     stage_upload,
     staged_upload_metrics,
 )
+from app.services.project_generator import (
+    generate_artifact_avatar,
+    generate_project_code,
+    normalize_project_code,
+)
 from datetime import datetime, timezone
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -599,6 +604,9 @@ def serialize_artifact_response(
     return {
         "id": artifact.id,
         "project_name": artifact.project_name,
+        "project_code": artifact.project_code,
+        "avatar_initials": artifact.avatar_initials,
+        "avatar_color": artifact.avatar_color,
         "project_type": artifact.project_type,
         "company_name": artifact.company_name,
         "industry": artifact.industry,
@@ -715,6 +723,34 @@ def validate_team_assignment(db: Session, team_ids: list[int], user: CurrentUser
     return teams
 
 
+def resolve_project_identity(
+    db: Session,
+    project_name: str,
+    requested_code: Optional[str],
+    tenant_id: str,
+) -> tuple[str, str, str]:
+    project_code = normalize_project_code(requested_code or "")
+    if project_code and not 3 <= len(project_code) <= 32:
+        raise HTTPException(
+            status_code=422,
+            detail="Project code must contain 3 to 32 letters, numbers, or hyphens",
+        )
+    if project_code and db.query(AnalysisArtifact).filter(
+        AnalysisArtifact.tenant_id == tenant_id,
+        AnalysisArtifact.project_code == project_code,
+    ).first():
+        raise HTTPException(status_code=409, detail="Project code already exists in this organization")
+    while not project_code:
+        candidate = generate_project_code(project_name)
+        if not db.query(AnalysisArtifact).filter(
+            AnalysisArtifact.tenant_id == tenant_id,
+            AnalysisArtifact.project_code == candidate,
+        ).first():
+            project_code = candidate
+    avatar_color, avatar_initials = generate_artifact_avatar(project_name)
+    return project_code, avatar_initials, avatar_color
+
+
 def run_initial_analysis(request: TranscriptRequest, db: Session, actor: CurrentUser):
     validate_analysis_request(request)
     source_text = request.source_text if request.source_text is not None else request.transcript
@@ -781,8 +817,14 @@ def run_initial_analysis(request: TranscriptRequest, db: Session, actor: Current
     initial_orchestration.setdefault("rerun_warnings", [])
 
     selected_team_ids = list(dict.fromkeys(request.team_ids or ([request.team_id] if request.team_id else [])))
+    project_code, avatar_initials, avatar_color = resolve_project_identity(
+        db, request.project_name, request.project_code, actor.tenant_id
+    )
     artifact = AnalysisArtifact(
         project_name=request.project_name,
+        project_code=project_code,
+        avatar_initials=avatar_initials,
+        avatar_color=avatar_color,
         project_type=request.project_type,
         company_name=request.company_name,
         industry=request.industry,
@@ -969,6 +1011,9 @@ def get_artifacts(
         {
             "id": artifact.id,
             "project_name": artifact.project_name,
+            "project_code": artifact.project_code,
+            "avatar_initials": artifact.avatar_initials,
+            "avatar_color": artifact.avatar_color,
             "project_type": artifact.project_type,
             "company_name": artifact.company_name,
             "industry": artifact.industry,
@@ -1035,6 +1080,9 @@ def get_artifacts_overview(
             {
                 "id": artifact.id,
                 "project_name": artifact.project_name,
+                "project_code": artifact.project_code,
+                "avatar_initials": artifact.avatar_initials,
+                "avatar_color": artifact.avatar_color,
                 "domain": artifact.domain,
                 "created_at": artifact.created_at,
                 "phase": get_analysis_phase(artifact.analysis_json or {}),
@@ -1510,6 +1558,9 @@ def get_artifact_traceability(
             {
                 "project_id": context_artifact.id,
                 "project_name": context_artifact.project_name,
+                "project_code": context_artifact.project_code,
+                "avatar_initials": context_artifact.avatar_initials,
+                "avatar_color": context_artifact.avatar_color,
                 "source_color": color,
                 "source_files": context_artifact.source_files or [],
                 "link_summary": (
@@ -1614,6 +1665,9 @@ def restore_artifact_version(
         "artifact": {
             "id": artifact.id,
             "project_name": artifact.project_name,
+            "project_code": artifact.project_code,
+            "avatar_initials": artifact.avatar_initials,
+            "avatar_color": artifact.avatar_color,
             "project_type": artifact.project_type,
             "company_name": artifact.company_name,
             "industry": artifact.industry,

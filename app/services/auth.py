@@ -359,6 +359,12 @@ def password_is_expired(user: User) -> bool:
 
 
 def create_password_reset_token(db: Session, user: User, hours: int = 24) -> str:
+    now = datetime.now(timezone.utc)
+    db.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == user.id,
+        PasswordResetToken.tenant_id == user.tenant_id,
+        PasswordResetToken.used_at.is_(None),
+    ).update({PasswordResetToken.used_at: now}, synchronize_session=False)
     raw_token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     db.add(
@@ -366,7 +372,7 @@ def create_password_reset_token(db: Session, user: User, hours: int = 24) -> str
             user_id=user.id,
             tenant_id=user.tenant_id,
             token_hash=token_hash,
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=hours),
+            expires_at=now + timedelta(hours=hours),
         )
     )
     return raw_token

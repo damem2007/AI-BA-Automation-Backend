@@ -103,6 +103,8 @@ sequenceDiagram
 | Identity lifecycle | Local and SSO users coexist with password policy, expiry, status, onboarding email, provider sync, and local-email collision protection. |
 | Tenant registry | Global root creates organizations; tenant IDs scope identity uniqueness, teams, mappings, artifacts, versions, reset tokens, providers, and settings. |
 | Team governance | Projects may have multiple teams; each team independently controls whether it may span multiple projects. Membership grants project access. |
+| Project identity | Every artifact has a tenant-unique project code plus persisted avatar initials and color, generated once and reused across all views. |
+| Onboarding | Local invitations issue one active reset token at a time. Delivery state is tracked and pending invitations can be resent without blocking account creation when SMTP is unavailable. |
 | Control plane | Shared job metadata, queue capacity, stale-job detection, and rate limiting. Uses Redis in enterprise deployments and local memory for development fallback. |
 | RAM staging | Holds uploaded source bytes briefly in the accepting API process. Enforces total memory budget and TTL. |
 | Source normalization | Converts supported documents, images, audio, and scanned PDFs into deterministic evidence with hashes, extraction method, and source references. |
@@ -123,6 +125,7 @@ Persisted:
 - Job status/result metadata while retained by the control plane.
 - Tenant settings, users, roles, identity providers, team memberships, and project-team mappings.
 - Organization registry plus tenant lineage on artifacts, versions, memberships, mappings, and reset tokens.
+- Tenant-unique project codes and stable project avatar presentation metadata.
 - Hashed local passwords and hashed one-time reset tokens; plaintext passwords are never persisted.
 
 Not persisted by the application:

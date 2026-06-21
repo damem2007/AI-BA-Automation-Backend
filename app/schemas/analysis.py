@@ -50,6 +50,7 @@ class SourceFileInput(BaseModel):
 
 class TranscriptRequest(BaseModel):
      project_name: str
+     project_code: Optional[str] = None
      transcript: str = ""
      source_text: Optional[str] = None
      project_type: Literal["internal", "external"] = "internal"

@@ -181,7 +181,16 @@ def serialize_team(db: Session, team: Team, current_user: CurrentUser) -> dict:
         "membership_role": membership.membership_role if membership else None,
         "is_archived": team.is_archived,
         "project_count": len(projects),
-        "projects": [{"id": project.id, "project_name": project.project_name} for project in projects],
+        "projects": [
+            {
+                "id": project.id,
+                "project_name": project.project_name,
+                "project_code": project.project_code,
+                "avatar_initials": project.avatar_initials,
+                "avatar_color": project.avatar_color,
+            }
+            for project in projects
+        ],
         "members": [{"id": member.id, "name": member.name, "email": member.email} for member in members],
         "created_at": team.created_at,
     }
@@ -465,6 +474,41 @@ def update_user(
     return serialize_user(db, user, role)
 
 
+@settings_router.post("/users/{user_id}/resend-onboarding")
+def resend_user_onboarding(
+    user_id: str,
+    actor: CurrentUser = Depends(require_permission("manage_users")),
+    db: Session = Depends(get_auth_db),
+):
+    user = db.query(User).filter(User.id == user_id, User.is_archived.is_(False)).first()
+    if not user or (not actor.is_global and user.tenant_id != actor.tenant_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.onboarding_status not in {"pending", "email_pending_configuration"}:
+        raise HTTPException(status_code=409, detail="Onboarding is not pending for this user")
+
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    try:
+        if user.auth_source == "local":
+            reset_token = create_password_reset_token(db, user)
+            delivered = send_local_onboarding(
+                user.email,
+                user.name,
+                f"{frontend_url}/reset-password?token={reset_token}",
+            )
+        else:
+            delivered = send_sso_onboarding(user.email, user.name, "enterprise SSO")
+    except (OSError, RuntimeError):
+        delivered = False
+    user.onboarding_status = "email_sent" if delivered else "email_pending_configuration"
+    db.commit()
+    role = db.query(Role).filter(Role.id == user.role_id).first()
+    return {
+        "message": "Onboarding email sent" if delivered else "Email service is not configured; invitation remains pending",
+        "delivered": delivered,
+        "user": serialize_user(db, user, role),
+    }
+
+
 @settings_router.post("/users/{user_id}/archive")
 def archive_user(
     user_id: str,
@@ -596,6 +640,9 @@ def list_archive(
             {
                 "id": project.id,
                 "project_name": project.project_name,
+                "project_code": project.project_code,
+                "avatar_initials": project.avatar_initials,
+                "avatar_color": project.avatar_color,
                 "team_id": project.team_id,
                 "archived_at": project.archived_at,
                 "archived_by": project.archived_by,
@@ -773,7 +820,14 @@ def get_project_team_mapping(
         by_project.setdefault(assignment.artifact_id, []).append(assignment.team_id)
     return {
         "projects": [
-            {"id": project.id, "project_name": project.project_name, "team_ids": by_project.get(project.id, [])}
+            {
+                "id": project.id,
+                "project_name": project.project_name,
+                "project_code": project.project_code,
+                "avatar_initials": project.avatar_initials,
+                "avatar_color": project.avatar_color,
+                "team_ids": by_project.get(project.id, []),
+            }
             for project in projects
         ],
         "teams": [

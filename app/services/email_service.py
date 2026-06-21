@@ -23,13 +23,17 @@ def send_email(recipient: str, subject: str, body: str) -> bool:
     message["To"] = recipient
     message["Subject"] = subject
     message.set_content(body)
-    with smtplib.SMTP(host, port, timeout=20) as client:
-        if use_tls:
-            client.starttls()
-        if username:
-            client.login(username, password)
-        client.send_message(message)
-    return True
+    try:
+        with smtplib.SMTP(host, port, timeout=20) as client:
+            if use_tls:
+                client.starttls()
+            if username:
+                client.login(username, password)
+            client.send_message(message)
+        return True
+    except (OSError, smtplib.SMTPException):
+        # Account creation remains successful and the pending status enables a later resend.
+        return False
 
 
 def send_local_onboarding(recipient: str, name: str, reset_url: str) -> bool:
