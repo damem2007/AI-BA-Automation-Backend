@@ -28,7 +28,7 @@ def upgrade() -> None:
         sa.Column("is_archived", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.UniqueConstraint("name"),
+        sa.UniqueConstraint("name", name="roles_name_key"),
     )
     op.create_index("ix_roles_name", "roles", ["name"], unique=True)
     op.create_index("ix_roles_is_archived", "roles", ["is_archived"])
@@ -47,9 +47,9 @@ def upgrade() -> None:
         sa.Column("is_archived", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.UniqueConstraint("external_subject"),
-        sa.UniqueConstraint("username"),
-        sa.UniqueConstraint("email"),
+        sa.UniqueConstraint("external_subject", name="users_external_subject_key"),
+        sa.UniqueConstraint("username", name="users_username_key"),
+        sa.UniqueConstraint("email", name="users_email_key"),
     )
     op.create_index("ix_users_external_subject", "users", ["external_subject"], unique=True)
     op.create_index("ix_users_tenant_id", "users", ["tenant_id"])
@@ -70,7 +70,7 @@ def upgrade() -> None:
         sa.Column("archived_by", sa.String(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.UniqueConstraint("slug"),
+        sa.UniqueConstraint("slug", name="teams_slug_key"),
     )
     op.create_index("ix_teams_slug", "teams", ["slug"], unique=True)
     op.create_index("ix_teams_owner_user_id", "teams", ["owner_user_id"])
@@ -88,29 +88,31 @@ def upgrade() -> None:
     op.create_index("ix_team_memberships_team_id", "team_memberships", ["team_id"])
     op.create_index("ix_team_memberships_user_id", "team_memberships", ["user_id"])
 
-    op.add_column("analysis_artifacts", sa.Column("is_archived", sa.Boolean(), nullable=False, server_default=sa.false()))
-    op.add_column("analysis_artifacts", sa.Column("archived_at", sa.DateTime(timezone=True), nullable=True))
-    op.add_column("analysis_artifacts", sa.Column("archived_by", sa.String(), nullable=True))
-    op.add_column("analysis_artifacts", sa.Column("owner_user_id", sa.String(), nullable=True))
-    op.add_column("analysis_artifacts", sa.Column("team_id", sa.Integer(), nullable=True))
-    op.create_foreign_key("fk_analysis_artifacts_owner_user", "analysis_artifacts", "users", ["owner_user_id"], ["id"])
-    op.create_foreign_key("fk_analysis_artifacts_team", "analysis_artifacts", "teams", ["team_id"], ["id"])
-    op.create_index("ix_analysis_artifacts_is_archived", "analysis_artifacts", ["is_archived"])
-    op.create_index("ix_analysis_artifacts_owner_user_id", "analysis_artifacts", ["owner_user_id"])
-    op.create_index("ix_analysis_artifacts_team_id", "analysis_artifacts", ["team_id"])
+    with op.batch_alter_table("analysis_artifacts") as batch:
+        batch.add_column(sa.Column("is_archived", sa.Boolean(), nullable=False, server_default=sa.false()))
+        batch.add_column(sa.Column("archived_at", sa.DateTime(timezone=True), nullable=True))
+        batch.add_column(sa.Column("archived_by", sa.String(), nullable=True))
+        batch.add_column(sa.Column("owner_user_id", sa.String(), nullable=True))
+        batch.add_column(sa.Column("team_id", sa.Integer(), nullable=True))
+        batch.create_foreign_key("fk_analysis_artifacts_owner_user", "users", ["owner_user_id"], ["id"])
+        batch.create_foreign_key("fk_analysis_artifacts_team", "teams", ["team_id"], ["id"])
+        batch.create_index("ix_analysis_artifacts_is_archived", ["is_archived"])
+        batch.create_index("ix_analysis_artifacts_owner_user_id", ["owner_user_id"])
+        batch.create_index("ix_analysis_artifacts_team_id", ["team_id"])
 
 
 def downgrade() -> None:
-    op.drop_index("ix_analysis_artifacts_team_id", table_name="analysis_artifacts")
-    op.drop_index("ix_analysis_artifacts_owner_user_id", table_name="analysis_artifacts")
-    op.drop_index("ix_analysis_artifacts_is_archived", table_name="analysis_artifacts")
-    op.drop_constraint("fk_analysis_artifacts_team", "analysis_artifacts", type_="foreignkey")
-    op.drop_constraint("fk_analysis_artifacts_owner_user", "analysis_artifacts", type_="foreignkey")
-    op.drop_column("analysis_artifacts", "team_id")
-    op.drop_column("analysis_artifacts", "owner_user_id")
-    op.drop_column("analysis_artifacts", "archived_by")
-    op.drop_column("analysis_artifacts", "archived_at")
-    op.drop_column("analysis_artifacts", "is_archived")
+    with op.batch_alter_table("analysis_artifacts") as batch:
+        batch.drop_index("ix_analysis_artifacts_team_id")
+        batch.drop_index("ix_analysis_artifacts_owner_user_id")
+        batch.drop_index("ix_analysis_artifacts_is_archived")
+        batch.drop_constraint("fk_analysis_artifacts_team", type_="foreignkey")
+        batch.drop_constraint("fk_analysis_artifacts_owner_user", type_="foreignkey")
+        batch.drop_column("team_id")
+        batch.drop_column("owner_user_id")
+        batch.drop_column("archived_by")
+        batch.drop_column("archived_at")
+        batch.drop_column("is_archived")
     op.drop_table("team_memberships")
     op.drop_table("teams")
     op.drop_table("users")

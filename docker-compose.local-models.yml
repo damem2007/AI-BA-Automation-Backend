@@ -1,0 +1,72 @@
+services:
+  qwen-reasoning:
+    image: vllm/vllm-openai:latest
+    container_name: ba-qwen-reasoning
+    command:
+      - --model
+      - ${LOCAL_QWEN_REASONING_MODEL:-Qwen/Qwen3.6-35B-A3B}
+      - --served-model-name
+      - ${LOCAL_QWEN_REASONING_MODEL:-Qwen/Qwen3.6-35B-A3B}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --trust-remote-code
+      - --dtype
+      - auto
+      - --tensor-parallel-size
+      - ${LOCAL_QWEN_TENSOR_PARALLEL_SIZE:-1}
+      - --gpu-memory-utilization
+      - ${LOCAL_QWEN_GPU_MEMORY_UTILIZATION:-0.90}
+      - --max-model-len
+      - ${LOCAL_QWEN_REASONING_MAX_MODEL_LEN:-32768}
+      - --api-key
+      - ${LOCAL_QWEN_API_KEY:?Set LOCAL_QWEN_API_KEY before starting local model services}
+    ports:
+      - "8001:8000"
+    volumes:
+      - ${LOCAL_QWEN_MODEL_DIR:-./models/qwen}:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles: ["local-models"]
+
+  qwen-omni-extraction:
+    image: vllm/vllm-openai:latest
+    container_name: ba-qwen-omni-extraction
+    command:
+      - --model
+      - ${LOCAL_QWEN_EXTRACTION_MODEL:-Qwen/Qwen3-Omni-30B-A3B-Instruct}
+      - --served-model-name
+      - ${LOCAL_QWEN_EXTRACTION_MODEL:-Qwen/Qwen3-Omni-30B-A3B-Instruct}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --trust-remote-code
+      - --dtype
+      - auto
+      - --tensor-parallel-size
+      - ${LOCAL_QWEN_TENSOR_PARALLEL_SIZE:-1}
+      - --gpu-memory-utilization
+      - ${LOCAL_QWEN_GPU_MEMORY_UTILIZATION:-0.90}
+      - --api-key
+      - ${LOCAL_QWEN_API_KEY:?Set LOCAL_QWEN_API_KEY before starting local model services}
+    ports:
+      - "8002:8000"
+    volumes:
+      - ${LOCAL_QWEN_MODEL_DIR:-./models/qwen}:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles: ["local-models"]

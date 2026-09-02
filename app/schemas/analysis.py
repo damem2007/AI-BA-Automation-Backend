@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 RelationshipType = Literal[
     "drives",
@@ -40,6 +40,8 @@ SourceIntent = Literal[
     "unknown",
 ]
 
+ModelProvider = Literal["openai", "local_qwen", "hybrid"]
+
 class SourceFileInput(BaseModel):
      name: str
      type: Optional[str] = None
@@ -49,6 +51,8 @@ class SourceFileInput(BaseModel):
 
 
 class TranscriptRequest(BaseModel):
+     project_id: Optional[int] = None
+     artifact_id: Optional[int] = None
      project_name: str
      project_code: Optional[str] = None
      transcript: str = ""
@@ -74,6 +78,34 @@ class TranscriptRequest(BaseModel):
      country: Optional[str] = None
      source_intent: SourceIntent = "unknown"
      source_subtype: Optional[str] = None
+     model_provider: ModelProvider = "openai"
+     reasoning_model: Optional[str] = None
+     extraction_model: Optional[str] = None
+
+
+class ProjectCreateRequest(BaseModel):
+     project_name: str
+     project_code: Optional[str] = None
+     project_type: Literal["internal", "external"] = "internal"
+     team_id: Optional[int] = None
+     team_ids: Optional[List[int]] = None
+     company_name: Optional[str] = None
+     industry: Optional[str] = None
+     domain: Optional[str] = None
+     initiative_type: Optional[str] = None
+     country: Optional[str] = None
+     signoff_configuration: Optional[Dict[str, Any]] = None
+
+
+class ProjectUpdateRequest(BaseModel):
+     project_name: Optional[str] = None
+     project_type: Optional[Literal["internal", "external"]] = None
+     company_name: Optional[str] = None
+     industry: Optional[str] = None
+     domain: Optional[str] = None
+     initiative_type: Optional[str] = None
+     country: Optional[str] = None
+     signoff_configuration: Optional[Dict[str, Any]] = None
 
 
 class RefinementRequest(BaseModel):
@@ -86,6 +118,9 @@ class RefinementRequest(BaseModel):
      infer_additional_techniques: bool = True
      selected_outputs: Optional[List[str]] = None
      source_files: Optional[List[SourceFileInput]] = None
+     model_provider: Optional[ModelProvider] = None
+     reasoning_model: Optional[str] = None
+     extraction_model: Optional[str] = None
      refinement_output_mode: Literal["aggregated", "phase_only"] = "aggregated"
      current_version_id: Optional[int] = None
 
@@ -223,6 +258,10 @@ class ProjectMetadata(BaseModel):
     initiative_type: str = ""
     created_at: str = ""
     analysis_version: str = "CBAKF-1.0"
+    model_provider: ModelProvider = "openai"
+    reasoning_model: str = ""
+    extraction_model: str = ""
+    data_residency_mode: str = ""
 
 
 class AnalysisOrchestration(BaseModel):
@@ -266,6 +305,9 @@ class MetadataItem(BaseModel):
 class SourceMaterial(BaseModel):
     type: str = ""
     name: str = ""
+    source_code: str = ""
+    content_fingerprint: str = ""
+    cache_status: str = ""
     metadata: List[MetadataItem] = Field(default_factory=list)
     source_reference: str = ""
 
@@ -446,6 +488,70 @@ class DefectCategory(BaseModel):
     confidence: float = 0
 
 
+class RequirementQualityFinding(BaseModel):
+    id: str = ""
+    requirement_id: str = ""
+    requirement_type: str = ""
+    quality_dimension: str = ""
+    score: float = 0
+    issue: str = ""
+    recommendation: str = ""
+    blocking_severity: str = ""
+    source_reference: str = ""
+    confidence: float = 0
+    metadata: List[MetadataItem] = Field(default_factory=list)
+
+
+class RequirementsQuality(BaseModel):
+    overall_score: float = 0
+    ready_for_signoff: bool = False
+    clear_requirements: List[str] = Field(default_factory=list)
+    ambiguous_requirements: List[RequirementQualityFinding] = Field(default_factory=list)
+    untestable_requirements: List[RequirementQualityFinding] = Field(default_factory=list)
+    missing_acceptance_criteria: List[RequirementQualityFinding] = Field(default_factory=list)
+    missing_data_rules: List[RequirementQualityFinding] = Field(default_factory=list)
+    missing_exception_paths: List[RequirementQualityFinding] = Field(default_factory=list)
+    duplicate_or_conflicting_requirements: List[RequirementQualityFinding] = Field(default_factory=list)
+    signoff_blockers: List[RequirementQualityFinding] = Field(default_factory=list)
+    improvement_recommendations: List[SemanticEntity] = Field(default_factory=list)
+
+
+class ApprovalAssignment(BaseModel):
+    id: str = ""
+    artifact_entity_id: str = ""
+    artifact_entity_type: str = ""
+    approval_level: str = ""
+    assigned_role: str = ""
+    assigned_stakeholder_id: str = ""
+    approval_status: str = ""
+    decision_right: str = ""
+    due_date: str = ""
+    rationale: str = ""
+    source_reference: str = ""
+    confidence: float = 0
+    metadata: List[MetadataItem] = Field(default_factory=list)
+
+
+class ApprovalGovernance(BaseModel):
+    approval_model: str = ""
+    approval_assignments: List[ApprovalAssignment] = Field(default_factory=list)
+    signoff_sequence: List[SemanticEntity] = Field(default_factory=list)
+    raci_matrix: List[SemanticEntity] = Field(default_factory=list)
+    unresolved_approval_risks: List[SemanticEntity] = Field(default_factory=list)
+
+
+class DiagramArtifact(BaseModel):
+    id: str = ""
+    title: str = ""
+    diagram_type: str = ""
+    mermaid_syntax: str = ""
+    description: str = ""
+    related_entities: List[str] = Field(default_factory=list)
+    source_reference: str = ""
+    confidence: float = 0
+    metadata: List[MetadataItem] = Field(default_factory=list)
+
+
 class ImpactAnalysis(BaseModel):
     change_summary: SemanticEntity = Field(default_factory=SemanticEntity)
     impacted_systems: List[SemanticEntity] = Field(default_factory=list)
@@ -531,7 +637,10 @@ class CBAKFAnalysisOutput(BaseModel):
     governance_analysis: GovernanceAnalysis = Field(default_factory=GovernanceAnalysis)
     process_intelligence: ProcessIntelligence = Field(default_factory=ProcessIntelligence)
     test_intelligence: TestIntelligence = Field(default_factory=TestIntelligence)
+    requirements_quality: RequirementsQuality = Field(default_factory=RequirementsQuality)
     impact_analysis: ImpactAnalysis = Field(default_factory=ImpactAnalysis)
+    approval_governance: ApprovalGovernance = Field(default_factory=ApprovalGovernance)
+    diagram_artifacts: List[DiagramArtifact] = Field(default_factory=list)
     executive_translation: ExecutiveTranslation = Field(default_factory=ExecutiveTranslation)
     enterprise_intelligence: EnterpriseIntelligence = Field(default_factory=EnterpriseIntelligence)
     output_views: OutputViews = Field(default_factory=OutputViews)

@@ -1,5 +1,96 @@
 # Changelog
 
+## 2026-07-02 - BA flow intelligence productization
+
+### Added
+
+- Canonical `requirements_quality` section for requirements clarity, testability, acceptance
+  coverage, exception paths, data rules, conflicts, and sign-off readiness.
+- Canonical `approval_governance` section for approval levels, RACI candidates, decision rights,
+  sign-off sequence, assigned approvers/roles, and unresolved approval risks.
+- Canonical `diagram_artifacts` section for Mermaid-ready BA/BSA visual artifacts such as process,
+  system, data, journey, architecture, timeline, requirement, and governance diagrams.
+- Persistent artifact approval assignments with assignee, requester, approval level, status, due
+  date, notes, tenant lineage, and artifact-scoped candidate lookup.
+- Migration `k7b5c1d9e023` for approval assignment workflow storage and lookup indexes.
+- Project-level `signoff_configuration` for switching individual module sign-offs on or off per
+  project while preserving final artifact sign-off as the end-of-workflow gate.
+- Migration `l8c2f5a1d734` for persisted project sign-off configuration.
+
+### Changed
+
+- Analysis prompting now treats UAT planning as a first-class delivery output, including positive,
+  negative, edge, regression, API/interface, reconciliation, reporting, role/access, control, and
+  readiness coverage.
+- Refinement merging now preserves and incrementally improves requirements quality, approval
+  governance, and diagram artifacts across phases.
+- The intelligence endpoint now returns requirements quality, approval governance, and diagram
+  artifacts alongside test, impact, process, executive, and enterprise intelligence.
+- Artifact APIs now support approval assignment list, create, candidate lookup, and status update
+  operations under `/analysis-artifacts/{id}/approvals`.
+- Project and artifact responses now include effective sign-off configuration so intelligence
+  modules can respect disabled project sign-off checkpoints.
+- Export service now supports `diagram_artifacts`, preserving Mermaid syntax in Markdown exports
+  and including diagram artifact content in other export formats.
+
+## 2026-07-01 - First-class project governance
+
+### Added
+
+- Durable `projects` table as the parent for analysis artifacts, with tenant-unique project code,
+  avatar metadata, owner, archive state, and project details.
+- `analysis_artifacts.project_id` so every artifact is an analysis output under a project.
+- Project-scoped team assignment through `project_teams.project_id`, replacing artifact-level
+  governance as the active authorization model.
+- `GET /projects` and `POST /projects` APIs for governed project creation and project library
+  access.
+- Migration `h4d1a2b3c901` to create projects, backfill existing artifacts into project parents,
+  and move team mappings to the project layer.
+- Migration `i5e2b7c9d104` to remove duplicated project presentation fields from
+  `analysis_artifacts`.
+- `PATCH /projects/{project_id}` for parent project rename and metadata updates.
+- Migration `j6a4f0e8c912` with composite indexes for project library pagination, artifact
+  listing, team-based access checks, artifact rollups, and version history ordering.
+
+### Changed
+
+- New analysis can target an existing project with `project_id`; access is checked against the
+  project owner, assigned teams, tenant, and `view_all_projects` permission.
+- Archive, restore, archive impact, settings mapping, project listing, and artifact serialization
+  now use project-level teams.
+- Artifact API responses hydrate project name, code, and avatar from the parent `projects` row
+  instead of storing redundant values on each artifact.
+- The enterprise governance fixture now verifies project listing, team inheritance, archive, and
+  restore against first-class projects.
+- `GET /projects` and `GET /analysis-artifacts` now return paginated, searchable responses with
+  batched project/team serialization to avoid full-table loads and per-row lookup loops.
+- `/analysis-artifacts-overview` now counts versions with a scoped aggregate and builds recent
+  artifact project metadata in one batch.
+- Traceability source projections now include artifact, project, project code, source system, and
+  source container context so internal evidence is user-meaningful and ready for future external
+  knowledge-base provenance.
+
+### Verified
+
+- Backend imports pass for models and routes.
+- `scripts/test_enterprise_governance_fixture.py` passes JWT, mapping, access, archive, and
+  restore coverage.
+- Python compile check passes with an isolated pycache.
+- Live Alembic state upgrades to `j6a4f0e8c912 (head)`.
+- Fresh base-to-head migration now succeeds against a temporary SQLite database, including the
+  first-class project schema and query indexes.
+
+### Fixed
+
+- Removed the unused `empty_project_analysis_payload()` helper from `app/routes/analyze.py`
+  because first-class project creation no longer needs an empty analysis stub.
+- Applied the first-class project migration to the configured live database so
+  `/analysis-artifacts-overview` no longer fails on missing `analysis_artifacts.project_id`.
+- Repaired the historical migration chain so fresh environments create the base artifact tables
+  before later migrations alter them.
+- Converted older constraint, JSON, timestamp, and nullable-column migration operations to
+  portable Alembic patterns where needed for local clean-db verification.
+
 ## 2026-06-20 - Project identity and resilient onboarding
 
 ### Added

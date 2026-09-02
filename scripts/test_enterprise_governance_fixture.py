@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from app.database import Base, SessionLocal, engine
 from app.main import app
-from app.models import AnalysisArtifact, PasswordResetToken
+from app.models import PasswordResetToken, Project
 from app.routes.analyze import reusable_entity_matches
 
 
@@ -32,17 +32,19 @@ def expect(response, status: int, context: str):
     return response.json() if response.content else None
 
 
+def page_items(payload):
+    return payload["items"] if isinstance(payload, dict) and "items" in payload else payload
+
+
 def create_project(name: str, owner_user_id: str) -> int:
     db = SessionLocal()
     try:
-        project = AnalysisArtifact(
+        project = Project(
             project_name=name,
             project_code="".join(character for character in name.upper() if character.isalnum())[:12],
             avatar_initials="".join(word[0] for word in name.split()[:2]).upper(),
             avatar_color="#2563EB",
             project_type="internal",
-            transcript="Fixture source",
-            analysis_json={"semantic_model": {}},
             tenant_id="local",
             owner_user_id=owner_user_id,
             is_archived=False,
@@ -150,7 +152,7 @@ def run_fixture() -> None:
             "viewer login",
         )
         viewer_headers = auth_header(viewer_login["access_token"])
-        visible = expect(client.get("/analysis-artifacts", headers=viewer_headers), 200, "team visibility")
+        visible = page_items(expect(client.get("/projects", headers=viewer_headers), 200, "team visibility"))
         assert [project["id"] for project in visible] == [assigned_project_id]
         assert {team["id"] for team in visible[0]["teams"]} == {alpha["id"], beta["id"]}
         expect(
@@ -196,14 +198,14 @@ def run_fixture() -> None:
         )
         archived = expect(client.get("/settings/archive", headers=root_headers), 200, "archive fixture list")
         assert [project["id"] for project in archived["projects"]] == [assigned_project_id]
-        after_archive = expect(client.get("/analysis-artifacts", headers=viewer_headers), 200, "archived visibility")
+        after_archive = page_items(expect(client.get("/projects", headers=viewer_headers), 200, "archived visibility"))
         assert [project["id"] for project in after_archive] == [hidden_project_id]
         expect(
             client.post(f"/settings/archive/projects/{assigned_project_id}/restore", headers=root_headers),
             200,
             "restore project",
         )
-        restored = expect(client.get("/analysis-artifacts", headers=viewer_headers), 200, "restored visibility")
+        restored = page_items(expect(client.get("/projects", headers=viewer_headers), 200, "restored visibility"))
         assert {project["id"] for project in restored} == {assigned_project_id, hidden_project_id}
 
         expect(client.post(f"/teams/{beta['id']}/archive", headers=root_headers), 200, "archive team")

@@ -62,18 +62,18 @@ def upgrade() -> None:
             },
         )
 
-    op.alter_column("analysis_artifacts", "project_code", nullable=False)
-    op.alter_column("analysis_artifacts", "avatar_initials", nullable=False)
-    op.alter_column("analysis_artifacts", "avatar_color", nullable=False)
-    op.create_index("ix_analysis_artifacts_project_code", "analysis_artifacts", ["project_code"])
-    op.create_unique_constraint(
-        "uq_artifact_tenant_project_code", "analysis_artifacts", ["tenant_id", "project_code"]
-    )
+    with op.batch_alter_table("analysis_artifacts") as batch:
+        batch.alter_column("project_code", existing_type=sa.String(), nullable=False)
+        batch.alter_column("avatar_initials", existing_type=sa.String(), nullable=False)
+        batch.alter_column("avatar_color", existing_type=sa.String(), nullable=False)
+        batch.create_index("ix_analysis_artifacts_project_code", ["project_code"])
+        batch.create_unique_constraint("uq_artifact_tenant_project_code", ["tenant_id", "project_code"])
 
 
 def downgrade() -> None:
-    op.drop_constraint("uq_artifact_tenant_project_code", "analysis_artifacts", type_="unique")
-    op.drop_index("ix_analysis_artifacts_project_code", table_name="analysis_artifacts")
-    op.drop_column("analysis_artifacts", "avatar_color")
-    op.drop_column("analysis_artifacts", "avatar_initials")
-    op.drop_column("analysis_artifacts", "project_code")
+    with op.batch_alter_table("analysis_artifacts") as batch:
+        batch.drop_constraint("uq_artifact_tenant_project_code", type_="unique")
+        batch.drop_index("ix_analysis_artifacts_project_code")
+        batch.drop_column("avatar_color")
+        batch.drop_column("avatar_initials")
+        batch.drop_column("project_code")

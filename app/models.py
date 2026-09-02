@@ -13,15 +13,37 @@ class Tenant(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class AnalysisArtifact(Base):
-    __tablename__ = "analysis_artifacts"
-    __table_args__ = (UniqueConstraint("tenant_id", "project_code", name="uq_artifact_tenant_project_code"),)
+class Project(Base):
+    __tablename__ = "projects"
+    __table_args__ = (UniqueConstraint("tenant_id", "project_code", name="uq_project_tenant_project_code"),)
 
     id = Column(Integer, primary_key=True, index=True)
     project_name = Column(String, nullable=False)
     project_code = Column(String, nullable=False, index=True)
     avatar_initials = Column(String, nullable=False)
     avatar_color = Column(String, nullable=False)
+    project_type = Column(String, nullable=False, default="internal", server_default="internal")
+    company_name = Column(String, nullable=True)
+    industry = Column(String, nullable=True)
+    domain = Column(String, nullable=True)
+    initiative_type = Column(String, nullable=True)
+    country = Column(String, nullable=True)
+    signoff_configuration = Column(JSON, nullable=True)
+    owner_user_id = Column(String, ForeignKey("users.id"), nullable=True, index=True)
+    tenant_id = Column(String, nullable=False, default="local", server_default="local", index=True)
+    is_deleted = Column(Boolean, default=False)
+    is_archived = Column(Boolean, default=False, nullable=False, server_default="false", index=True)
+    archived_at = Column(DateTime(timezone=True), nullable=True)
+    archived_by = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AnalysisArtifact(Base):
+    __tablename__ = "analysis_artifacts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     project_type = Column(String, nullable=False, default="internal", server_default="internal")
     company_name = Column(String, nullable=True)
     industry = Column(String, nullable=True)
@@ -61,6 +83,22 @@ class ArtifactVersion(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     restored_at = Column(DateTime(timezone=True), nullable=True, index=True)
     current_version_id = Column(Integer, nullable=True, index=True)
+
+
+class ArtifactApprovalAssignment(Base):
+    __tablename__ = "artifact_approval_assignments"
+
+    id = Column(Integer, primary_key=True)
+    artifact_id = Column(Integer, ForeignKey("analysis_artifacts.id"), nullable=False, index=True)
+    tenant_id = Column(String, nullable=False, default="local", server_default="local", index=True)
+    assigned_user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    requested_by_user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    approval_level = Column(String, nullable=False, default="business")
+    status = Column(String, nullable=False, default="pending", index=True)
+    due_date = Column(String, nullable=True)
+    notes = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class Role(Base):
@@ -138,10 +176,10 @@ class TeamMembership(Base):
 
 class ProjectTeam(Base):
     __tablename__ = "project_teams"
-    __table_args__ = (UniqueConstraint("artifact_id", "team_id", name="uq_project_team"),)
+    __table_args__ = (UniqueConstraint("project_id", "team_id", name="uq_project_team"),)
 
     id = Column(Integer, primary_key=True)
-    artifact_id = Column(Integer, ForeignKey("analysis_artifacts.id"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     team_id = Column(Integer, ForeignKey("teams.id"), nullable=False, index=True)
     tenant_id = Column(String, nullable=False, default="local", server_default="local", index=True)
     assigned_by = Column(String, ForeignKey("users.id"), nullable=False)

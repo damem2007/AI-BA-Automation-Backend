@@ -17,47 +17,53 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.drop_index("ix_roles_name", table_name="roles")
-    op.drop_constraint("roles_name_key", "roles", type_="unique")
-    op.create_index("ix_roles_name", "roles", ["name"])
-    op.create_unique_constraint("uq_role_tenant_name", "roles", ["tenant_id", "name"])
+    with op.batch_alter_table("roles") as batch:
+        batch.drop_index("ix_roles_name")
+        batch.drop_constraint("roles_name_key", type_="unique")
+        batch.create_index("ix_roles_name", ["name"])
+        batch.create_unique_constraint("uq_role_tenant_name", ["tenant_id", "name"])
 
-    for column in ("external_subject", "username", "email"):
-        op.drop_index(f"ix_users_{column}", table_name="users")
-        op.drop_constraint(f"users_{column}_key", "users", type_="unique")
-        op.create_index(f"ix_users_{column}", "users", [column])
-    op.create_unique_constraint("uq_user_tenant_subject", "users", ["tenant_id", "external_subject"])
-    op.create_unique_constraint("uq_user_tenant_username", "users", ["tenant_id", "username"])
-    op.create_unique_constraint("uq_user_tenant_email", "users", ["tenant_id", "email"])
+    with op.batch_alter_table("users") as batch:
+        for column in ("external_subject", "username", "email"):
+            batch.drop_index(f"ix_users_{column}")
+            batch.drop_constraint(f"users_{column}_key", type_="unique")
+            batch.create_index(f"ix_users_{column}", [column])
+        batch.create_unique_constraint("uq_user_tenant_subject", ["tenant_id", "external_subject"])
+        batch.create_unique_constraint("uq_user_tenant_username", ["tenant_id", "username"])
+        batch.create_unique_constraint("uq_user_tenant_email", ["tenant_id", "email"])
 
-    op.drop_index("ix_teams_slug", table_name="teams")
-    op.drop_constraint("teams_slug_key", "teams", type_="unique")
-    op.create_index("ix_teams_slug", "teams", ["slug"])
-    op.create_unique_constraint("uq_team_tenant_slug", "teams", ["tenant_id", "slug"])
+    with op.batch_alter_table("teams") as batch:
+        batch.drop_index("ix_teams_slug")
+        batch.drop_constraint("teams_slug_key", type_="unique")
+        batch.create_index("ix_teams_slug", ["slug"])
+        batch.create_unique_constraint("uq_team_tenant_slug", ["tenant_id", "slug"])
 
-    op.drop_constraint("identity_providers_issuer_key", "identity_providers", type_="unique")
-    op.create_unique_constraint(
-        "uq_provider_tenant_issuer", "identity_providers", ["tenant_id", "issuer"]
-    )
+    with op.batch_alter_table("identity_providers") as batch:
+        batch.drop_constraint("identity_providers_issuer_key", type_="unique")
+        batch.create_unique_constraint("uq_provider_tenant_issuer", ["tenant_id", "issuer"])
 
 
 def downgrade() -> None:
-    op.drop_constraint("uq_provider_tenant_issuer", "identity_providers", type_="unique")
-    op.create_unique_constraint("identity_providers_issuer_key", "identity_providers", ["issuer"])
+    with op.batch_alter_table("identity_providers") as batch:
+        batch.drop_constraint("uq_provider_tenant_issuer", type_="unique")
+        batch.create_unique_constraint("identity_providers_issuer_key", ["issuer"])
 
-    op.drop_constraint("uq_team_tenant_slug", "teams", type_="unique")
-    op.drop_index("ix_teams_slug", table_name="teams")
-    op.create_unique_constraint("teams_slug_key", "teams", ["slug"])
-    op.create_index("ix_teams_slug", "teams", ["slug"], unique=True)
+    with op.batch_alter_table("teams") as batch:
+        batch.drop_constraint("uq_team_tenant_slug", type_="unique")
+        batch.drop_index("ix_teams_slug")
+        batch.create_unique_constraint("teams_slug_key", ["slug"])
+        batch.create_index("ix_teams_slug", ["slug"], unique=True)
 
-    for constraint in ("uq_user_tenant_email", "uq_user_tenant_username", "uq_user_tenant_subject"):
-        op.drop_constraint(constraint, "users", type_="unique")
-    for column in ("external_subject", "username", "email"):
-        op.drop_index(f"ix_users_{column}", table_name="users")
-        op.create_unique_constraint(f"users_{column}_key", "users", [column])
-        op.create_index(f"ix_users_{column}", "users", [column], unique=True)
+    with op.batch_alter_table("users") as batch:
+        for constraint in ("uq_user_tenant_email", "uq_user_tenant_username", "uq_user_tenant_subject"):
+            batch.drop_constraint(constraint, type_="unique")
+        for column in ("external_subject", "username", "email"):
+            batch.drop_index(f"ix_users_{column}")
+            batch.create_unique_constraint(f"users_{column}_key", [column])
+            batch.create_index(f"ix_users_{column}", [column], unique=True)
 
-    op.drop_constraint("uq_role_tenant_name", "roles", type_="unique")
-    op.drop_index("ix_roles_name", table_name="roles")
-    op.create_unique_constraint("roles_name_key", "roles", ["name"])
-    op.create_index("ix_roles_name", "roles", ["name"], unique=True)
+    with op.batch_alter_table("roles") as batch:
+        batch.drop_constraint("uq_role_tenant_name", type_="unique")
+        batch.drop_index("ix_roles_name")
+        batch.create_unique_constraint("roles_name_key", ["name"])
+        batch.create_index("ix_roles_name", ["name"], unique=True)

@@ -32,6 +32,9 @@ IMAGE_MEDIA_TYPES = {
 def prepare_source_files_for_analysis(
     source_files: Optional[list[dict]],
     client: OpenAI,
+    extraction_model: Optional[str] = None,
+    transcription_model: Optional[str] = None,
+    extraction_provider: str = "openai",
 ) -> list[dict]:
     """Normalize every modality into stable text evidence before canonical analysis."""
     prepared = []
@@ -62,19 +65,49 @@ def prepare_source_files_for_analysis(
         extracted_text = local_text
 
         if source_type == "audio" or extension in AUDIO_EXTENSIONS:
-            extracted_text = transcribe_audio(content, name, client)
-            extraction_method = "openai_transcription"
+            if extraction_provider == "local_qwen":
+                extracted_text = analyze_binary_file(
+                    content,
+                    media_type,
+                    name,
+                    client,
+                    extraction_model or MULTIMODAL_MODEL,
+                    "audio",
+                )
+                extraction_method = "local_qwen_audio"
+            else:
+                extracted_text = transcribe_audio(
+                    content,
+                    name,
+                    client,
+                    transcription_model or TRANSCRIPTION_MODEL,
+                )
+                extraction_method = "openai_transcription"
         elif source_type == "image" and extension in VISION_EXTENSIONS:
-            extracted_text = analyze_image(
-                content,
-                IMAGE_MEDIA_TYPES.get(extension, media_type),
-                name,
-                client,
-            )
-            extraction_method = "openai_vision"
+            if extraction_provider == "local_qwen":
+                extracted_text = analyze_local_image(
+                    content,
+                    IMAGE_MEDIA_TYPES.get(extension, media_type),
+                    name,
+                    client,
+                    extraction_model or MULTIMODAL_MODEL,
+                )
+            else:
+                extracted_text = analyze_image(
+                    content,
+                    IMAGE_MEDIA_TYPES.get(extension, media_type),
+                    name,
+                    client,
+                    extraction_model or MULTIMODAL_MODEL,
+                )
+            extraction_method = "local_qwen_vision" if extraction_provider == "local_qwen" else "openai_vision"
         elif source_type == "pdf" and len(normalize_text(local_text)) < PDF_TEXT_QUALITY_MIN_CHARS:
-            extracted_text = analyze_pdf(content, name, client)
-            extraction_method = "openai_pdf_vision_fallback"
+            if extraction_provider == "local_qwen":
+                extracted_text = ""
+                extraction_method = "local_qwen_pdf_requires_ocr"
+            else:
+                extracted_text = analyze_pdf(content, name, client, extraction_model or MULTIMODAL_MODEL)
+                extraction_method = "openai_pdf_vision_fallback"
         elif not local_text:
             extraction_method = "unsupported_or_unreadable"
 
@@ -85,10 +118,10 @@ def prepare_source_files_for_analysis(
     return prepared
 
 
-def analyze_image(content: bytes, media_type: str, name: str, client: OpenAI) -> str:
+def analyze_image(content: bytes, media_type: str, name: str, client: OpenAI, model: str) -> str:
     data_url = f"data:{media_type};base64,{base64.b64encode(content).decode('ascii')}"
     response = client.responses.create(
-        model=MULTIMODAL_MODEL,
+        model=model,
         input=[{
             "role": "user",
             "content": [
@@ -103,10 +136,25 @@ def analyze_image(content: bytes, media_type: str, name: str, client: OpenAI) ->
     return response.output_text or ""
 
 
-def analyze_pdf(content: bytes, name: str, client: OpenAI) -> str:
+def analyze_local_image(content: bytes, media_type: str, name: str, client: OpenAI, model: str) -> str:
+    data_url = f"data:{media_type};base64,{base64.b64encode(content).decode('ascii')}"
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": modality_prompt(name, "image")},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }],
+    )
+    return response.choices[0].message.content or ""
+
+
+def analyze_pdf(content: bytes, name: str, client: OpenAI, model: str) -> str:
     data_url = f"data:application/pdf;base64,{base64.b64encode(content).decode('ascii')}"
     response = client.responses.create(
-        model=MULTIMODAL_MODEL,
+        model=model,
         input=[{
             "role": "user",
             "content": [
@@ -122,11 +170,30 @@ def analyze_pdf(content: bytes, name: str, client: OpenAI) -> str:
     return response.output_text or ""
 
 
-def transcribe_audio(content: bytes, name: str, client: OpenAI) -> str:
+def analyze_binary_file(content: bytes, media_type: str, name: str, client: OpenAI, model: str, modality: str) -> str:
+    data_url = f"data:{media_type or 'application/octet-stream'};base64,{base64.b64encode(content).decode('ascii')}"
+    response = client.responses.create(
+        model=model,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": modality_prompt(name, modality)},
+                {
+                    "type": "input_file",
+                    "filename": name,
+                    "file_data": data_url,
+                },
+            ],
+        }],
+    )
+    return response.output_text or ""
+
+
+def transcribe_audio(content: bytes, name: str, client: OpenAI, model: str) -> str:
     audio = io.BytesIO(content)
     audio.name = name
     transcription = client.audio.transcriptions.create(
-        model=TRANSCRIPTION_MODEL,
+        model=model,
         file=audio,
         response_format="text",
         prompt=(

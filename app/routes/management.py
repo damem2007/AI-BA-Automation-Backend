@@ -14,6 +14,7 @@ from app.models import (
     AnalysisArtifact,
     ArtifactVersion,
     IdentityProvider,
+    Project,
     ProjectTeam,
     Role,
     Team,
@@ -49,6 +50,7 @@ from app.services.auth import (
 from app.services.email_service import send_local_onboarding, send_sso_onboarding
 from app.services.rbac import ROLE_PERMISSIONS
 
+from app.services.project_generator import AVATAR_COLORS
 
 teams_router = APIRouter(prefix="/teams", tags=["teams"])
 settings_router = APIRouter(prefix="/settings", tags=["settings"])
@@ -121,7 +123,7 @@ def serialize_role(role: Role) -> dict:
 
 
 def team_avatar(team: Team) -> dict:
-    palette = ["#147d92", "#7c3aed", "#b45309", "#047857", "#be123c", "#3f6212"]
+    palette = AVATAR_COLORS #["#147d92", "#7c3aed", "#b45309", "#047857", "#be123c", "#3f6212"]
     icons = ["users", "blocks", "workflow", "layers", "briefcase", "network"]
     return {"color": palette[team.id % len(palette)], "icon": icons[team.id % len(icons)]}
 
@@ -161,10 +163,10 @@ def serialize_team(db: Session, team: Team, current_user: CurrentUser) -> dict:
         TeamMembership.team_id == team.id,
         TeamMembership.user_id == current_user.id,
     ).first()
-    projects = db.query(AnalysisArtifact).join(ProjectTeam, ProjectTeam.artifact_id == AnalysisArtifact.id).filter(
+    projects = db.query(Project).join(ProjectTeam, ProjectTeam.project_id == Project.id).filter(
         ProjectTeam.team_id == team.id,
-        AnalysisArtifact.is_archived.is_(False),
-    ).order_by(AnalysisArtifact.project_name.asc()).all()
+        Project.is_archived.is_(False),
+    ).order_by(Project.project_name.asc()).all()
     members = db.query(User).join(TeamMembership, TeamMembership.user_id == User.id).filter(
         TeamMembership.team_id == team.id,
         User.is_archived.is_(False),
@@ -324,7 +326,7 @@ def update_team(
         team.description = request.description.strip()
     if request.allow_multiple_projects is not None:
         if not request.allow_multiple_projects:
-            project_count = db.query(ProjectTeam.artifact_id).filter(
+            project_count = db.query(ProjectTeam.project_id).filter(
                 ProjectTeam.team_id == team.id
             ).distinct().count()
             if project_count > 1:
@@ -626,8 +628,8 @@ def list_archive(
     user: CurrentUser = Depends(require_permission("restore_archives")),
     db: Session = Depends(get_auth_db),
 ):
-    projects = db.query(AnalysisArtifact).filter(AnalysisArtifact.is_archived.is_(True)).order_by(
-        AnalysisArtifact.archived_at.desc()
+    projects = db.query(Project).filter(Project.is_archived.is_(True)).order_by(
+        Project.archived_at.desc()
     ).all()
     teams = db.query(Team).filter(Team.is_archived.is_(True)).order_by(Team.archived_at.desc()).all()
     users = db.query(User, Role).join(Role, Role.id == User.role_id).filter(User.is_archived.is_(True)).all()
@@ -643,7 +645,13 @@ def list_archive(
                 "project_code": project.project_code,
                 "avatar_initials": project.avatar_initials,
                 "avatar_color": project.avatar_color,
-                "team_id": project.team_id,
+                "teams": [
+                    {"id": team.id, "name": team.name, **team_avatar(team)}
+                    for team in db.query(Team).join(ProjectTeam, ProjectTeam.team_id == Team.id).filter(
+                        ProjectTeam.project_id == project.id,
+                        Team.is_archived.is_(False),
+                    ).order_by(Team.name.asc()).all()
+                ],
                 "archived_at": project.archived_at,
                 "archived_by": project.archived_by,
             }
@@ -672,19 +680,23 @@ def get_archive_impact(
 
     dependencies = []
     if resource_type == "project":
-        artifact = db.query(AnalysisArtifact).filter(AnalysisArtifact.id == int(resource_id)).first()
-        if not artifact or (not actor.is_global and artifact.tenant_id != actor.tenant_id):
+        project = db.query(Project).filter(Project.id == int(resource_id)).first()
+        if not project or (not actor.is_global and project.tenant_id != actor.tenant_id):
             raise HTTPException(status_code=404, detail="Project not found")
-        version_count = db.query(ArtifactVersion).filter(ArtifactVersion.artifact_id == artifact.id).count()
-        team_count = db.query(ProjectTeam).filter(ProjectTeam.artifact_id == artifact.id).count()
-        relationship_count = len((artifact.analysis_json or {}).get("entity_relationships") or [])
+        artifacts = db.query(AnalysisArtifact).filter(AnalysisArtifact.project_id == project.id).all()
+        artifact_ids = [artifact.id for artifact in artifacts]
+        version_count = db.query(ArtifactVersion).filter(ArtifactVersion.artifact_id.in_(artifact_ids)).count() if artifact_ids else 0
+        team_count = db.query(ProjectTeam).filter(ProjectTeam.project_id == project.id).count()
+        relationship_count = sum(len((artifact.analysis_json or {}).get("entity_relationships") or []) for artifact in artifacts)
+        source_count = sum(len(artifact.source_files or []) for artifact in artifacts)
         dependencies = [
+            f"{len(artifacts)} retained analysis artifact{'s' if len(artifacts) != 1 else ''}",
             f"{version_count} retained version{'s' if version_count != 1 else ''}",
             f"{team_count} assigned team{'s' if team_count != 1 else ''}",
             f"{relationship_count} canonical relationship{'s' if relationship_count != 1 else ''}",
-            f"{len(artifact.source_files or [])} source metadata record{'s' if len(artifact.source_files or []) != 1 else ''}",
+            f"{source_count} source metadata record{'s' if source_count != 1 else ''}",
         ]
-        name = artifact.project_name
+        name = project.project_name
     elif resource_type == "team":
         team = db.query(Team).filter(Team.id == int(resource_id)).first()
         if not team or (not actor.is_global and team.tenant_id != actor.tenant_id):
@@ -702,7 +714,7 @@ def get_archive_impact(
             raise HTTPException(status_code=404, detail="User not found")
         membership_count = db.query(TeamMembership).filter(TeamMembership.user_id == user.id).count()
         owned_team_count = db.query(Team).filter(Team.owner_user_id == user.id).count()
-        owned_project_count = db.query(AnalysisArtifact).filter(AnalysisArtifact.owner_user_id == user.id).count()
+        owned_project_count = db.query(Project).filter(Project.owner_user_id == user.id).count()
         dependencies = [
             f"{membership_count} retained team membership{'s' if membership_count != 1 else ''}",
             f"{owned_team_count} owned team{'s' if owned_team_count != 1 else ''}",
@@ -720,38 +732,54 @@ def get_archive_impact(
     }
 
 
-@settings_router.post("/archive/projects/{artifact_id}")
+@settings_router.post("/archive/projects/{project_id}")
 def archive_project(
-    artifact_id: int,
+    project_id: int,
     user: CurrentUser = Depends(require_permission("archive_projects")),
     db: Session = Depends(get_auth_db),
 ):
-    artifact = db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
-    if not artifact:
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if not user.is_global and artifact.tenant_id != user.tenant_id:
+    if not user.is_global and project.tenant_id != user.tenant_id:
         raise HTTPException(status_code=404, detail="Project not found")
-    artifact.is_archived = True
-    artifact.archived_at = datetime.now(timezone.utc)
-    artifact.archived_by = user.id
+    project.is_archived = True
+    project.archived_at = datetime.now(timezone.utc)
+    project.archived_by = user.id
+    db.query(AnalysisArtifact).filter(AnalysisArtifact.project_id == project.id).update(
+        {
+            AnalysisArtifact.is_archived: True,
+            AnalysisArtifact.archived_at: project.archived_at,
+            AnalysisArtifact.archived_by: user.id,
+        },
+        synchronize_session=False,
+    )
     db.commit()
     return {"message": "Project archived"}
 
 
-@settings_router.post("/archive/projects/{artifact_id}/restore")
+@settings_router.post("/archive/projects/{project_id}/restore")
 def restore_project(
-    artifact_id: int,
+    project_id: int,
     actor: CurrentUser = Depends(require_permission("restore_archives")),
     db: Session = Depends(get_auth_db),
 ):
-    artifact = db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
-    if not artifact:
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if not actor.is_global and artifact.tenant_id != actor.tenant_id:
+    if not actor.is_global and project.tenant_id != actor.tenant_id:
         raise HTTPException(status_code=404, detail="Project not found")
-    artifact.is_archived = False
-    artifact.archived_at = None
-    artifact.archived_by = None
+    project.is_archived = False
+    project.archived_at = None
+    project.archived_by = None
+    db.query(AnalysisArtifact).filter(AnalysisArtifact.project_id == project.id).update(
+        {
+            AnalysisArtifact.is_archived: False,
+            AnalysisArtifact.archived_at: None,
+            AnalysisArtifact.archived_by: None,
+        },
+        synchronize_session=False,
+    )
     db.commit()
     return {"message": "Project restored"}
 
@@ -807,17 +835,17 @@ def get_project_team_mapping(
     actor: CurrentUser = Depends(require_permission("assign_project_teams")),
     db: Session = Depends(get_auth_db),
 ):
-    project_query = db.query(AnalysisArtifact).filter(AnalysisArtifact.is_archived.is_(False))
+    project_query = db.query(Project).filter(Project.is_archived.is_(False))
     team_query = db.query(Team).filter(Team.is_archived.is_(False))
     if not actor.is_global:
-        project_query = project_query.filter(AnalysisArtifact.tenant_id == actor.tenant_id)
+        project_query = project_query.filter(Project.tenant_id == actor.tenant_id)
         team_query = team_query.filter(Team.tenant_id == actor.tenant_id)
-    projects = project_query.order_by(AnalysisArtifact.project_name.asc()).all()
+    projects = project_query.order_by(Project.project_name.asc()).all()
     teams = team_query.order_by(Team.name.asc()).all()
-    assignments = db.query(ProjectTeam).filter(ProjectTeam.artifact_id.in_([item.id for item in projects])).all() if projects else []
+    assignments = db.query(ProjectTeam).filter(ProjectTeam.project_id.in_([item.id for item in projects])).all() if projects else []
     by_project = {}
     for assignment in assignments:
-        by_project.setdefault(assignment.artifact_id, []).append(assignment.team_id)
+        by_project.setdefault(assignment.project_id, []).append(assignment.team_id)
     return {
         "projects": [
             {
@@ -842,20 +870,20 @@ def get_project_team_mapping(
     }
 
 
-@settings_router.put("/projects/{artifact_id}/teams")
+@settings_router.put("/projects/{project_id}/teams")
 def update_project_teams(
-    artifact_id: int,
+    project_id: int,
     request: ProjectTeamsUpdate,
     actor: CurrentUser = Depends(require_permission("assign_project_teams")),
     db: Session = Depends(get_auth_db),
 ):
-    artifact = db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
-    if not artifact or (not actor.is_global and artifact.tenant_id != actor.tenant_id):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project or (not actor.is_global and project.tenant_id != actor.tenant_id):
         raise HTTPException(status_code=404, detail="Project not found")
     team_ids = list(dict.fromkeys(request.team_ids))
     teams = db.query(Team).filter(
         Team.id.in_(team_ids),
-        Team.tenant_id == artifact.tenant_id,
+        Team.tenant_id == project.tenant_id,
         Team.is_archived.is_(False),
     ).all() if team_ids else []
     if {team.id for team in teams} != set(team_ids):
@@ -863,17 +891,16 @@ def update_project_teams(
     for team in teams:
         existing_project = db.query(ProjectTeam).filter(
             ProjectTeam.team_id == team.id,
-            ProjectTeam.artifact_id != artifact.id,
+            ProjectTeam.project_id != project.id,
         ).first()
         if existing_project and not team.allow_multiple_projects:
             raise HTTPException(
                 status_code=409,
                 detail=f"{team.name} is limited to one project. Enable multi-project work in Team settings.",
             )
-    db.query(ProjectTeam).filter(ProjectTeam.artifact_id == artifact.id).delete(synchronize_session=False)
+    db.query(ProjectTeam).filter(ProjectTeam.project_id == project.id).delete(synchronize_session=False)
     for team_id in team_ids:
-        db.add(ProjectTeam(artifact_id=artifact.id, team_id=team_id, tenant_id=artifact.tenant_id, assigned_by=actor.id))
-    artifact.team_id = team_ids[0] if team_ids else None
+        db.add(ProjectTeam(project_id=project.id, team_id=team_id, tenant_id=project.tenant_id, assigned_by=actor.id))
     db.commit()
     return {"message": "Project team assignments updated", "team_ids": team_ids}
 

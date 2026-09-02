@@ -20,6 +20,7 @@ flowchart LR
 
     subgraph Frontend["Frontend"]
         FE --> SHELL["Application shell<br/>sidebar, themes, auth bootstrap"]
+        FE --> CREATE["Create Project"]
         FE --> NEW["New Project Analysis"]
         FE --> ART["Artifact Workspace"]
         FE --> TRACEUI["Traceability Page"]
@@ -27,7 +28,8 @@ flowchart LR
         FE --> VERS["Version Control"]
     end
 
-    NEW -->|"Base64 source payload + analysis request"| API["FastAPI API Instance"]
+    CREATE -->|"Project identity + team assignment"| API["FastAPI API Instance"]
+    NEW -->|"Existing project + Base64 source payload"| API
     ART -->|"Bearer JWT"| API
     TRACEUI --> API
     INTELUI --> API
@@ -96,20 +98,27 @@ sequenceDiagram
 
 | Component | Responsibility |
 | --- | --- |
-| Next.js app | Project navigation, new analysis, artifact workspace, phase wizard, sticky actions, intelligence, traceability, versions, login shell, and day/night theme. |
+| Next.js app | Dedicated project creation, project-scoped new analysis, artifact workspace, phase wizard, sticky actions, intelligence, traceability, versions, login shell, and day/night theme. |
 | FastAPI routes | Analysis generation/polling, artifact CRUD, refinement, exports, versions, compare, traceability, intelligence, auth bootstrap, and limit reporting. |
 | Authentication | Hybrid local JWT and OIDC validation with issuer, audience, scope, tenant, and expiry enforcement; local refresh and one-time reset tokens. |
 | Authorization | Tenant-scoped RBAC, custom roles, global-root override, team membership, project-team mappings, archive/restore controls, and `view_all_projects`. |
 | Identity lifecycle | Local and SSO users coexist with password policy, expiry, status, onboarding email, provider sync, and local-email collision protection. |
 | Tenant registry | Global root creates organizations; tenant IDs scope identity uniqueness, teams, mappings, artifacts, versions, reset tokens, providers, and settings. |
-| Team governance | Projects may have multiple teams; each team independently controls whether it may span multiple projects. Membership grants project access. |
-| Project identity | Every artifact has a tenant-unique project code plus persisted avatar initials and color, generated once and reused across all views. |
+| Team governance | First-class projects may have multiple teams; each team independently controls whether it may span multiple projects. Membership grants project access. |
+| Project identity | Projects are durable parent records with tenant-unique project code, persisted avatar initials, color, owner, archive state, team assignments, and editable project metadata. |
+| Artifact identity | Artifacts are analysis outputs under a project. They store analysis-specific context and hydrate project name/code/avatar from the parent project instead of duplicating those fields. |
+| Portfolio access | Project and artifact library APIs are paginated and searchable. Route serialization batches project/team context to avoid per-row lookup loops. |
 | Onboarding | Local invitations issue one active reset token at a time. Delivery state is tracked and pending invitations can be resent without blocking account creation when SMTP is unavailable. |
 | Control plane | Shared job metadata, queue capacity, stale-job detection, and rate limiting. Uses Redis in enterprise deployments and local memory for development fallback. |
 | RAM staging | Holds uploaded source bytes briefly in the accepting API process. Enforces total memory budget and TTL. |
 | Source normalization | Converts supported documents, images, audio, and scanned PDFs into deterministic evidence with hashes, extraction method, and source references. |
 | Canonical analysis | Produces CBAKF semantic entities, relationships, requirements, process/test/impact intelligence, executive translation, and enterprise controls. |
-| Traceability service | Builds delivery-focused traceability and reports existing projects only when same-type canonical entities have meaningful semantic overlap, with source and relationship evidence. |
+| Requirements quality | Scores requirements for clarity, testability, acceptance coverage, data rules, exception paths, conflicts, and sign-off readiness. |
+| Approval governance | Projects stakeholder evidence into approval levels, RACI candidates, decision rights, sign-off sequence, and unresolved approval risks. |
+| Approval workflow | Persists artifact-level approval assignments, approvers, requesters, status, due dates, and notes for governed sign-off tracking. |
+| Diagram artifacts | Generates evidence-supported Mermaid-ready BA/BSA diagrams for process, system, data, journey, architecture, timeline, and governance views. |
+| Client deliverables | Export service includes canonical BA sections and Mermaid diagram artifacts for client-ready delivery packs. |
+| Traceability service | Builds delivery-focused traceability and reports existing projects only when same-type canonical entities have meaningful semantic overlap, with source, project, artifact, and relationship evidence. |
 | PostgreSQL | Persists artifacts, canonical JSON, source metadata, intelligence edits, and version snapshots. |
 | OpenAI APIs | Performs modality extraction and structured canonical BA generation. |
 
@@ -117,15 +126,21 @@ sequenceDiagram
 
 Persisted:
 
-- Project and artifact metadata.
+- Project metadata, team mappings, and artifact metadata.
+- Parent project identity fields, including project name, code, avatar, teams, and archive state.
 - Canonical analysis JSON.
 - Artifact versions and restore metadata.
 - Source-file metadata: name, MIME type, size, hash, extraction status, and source reference.
+- Source provenance projection metadata, including internal artifact/project context and source
+  container labels for traceability views.
+- Requirements quality findings, UAT/test intelligence, approval governance, impact analysis, and
+  Mermaid diagram artifact definitions as canonical JSON.
+- Artifact approval assignments and status history metadata for sign-off workflow tracking.
 - Intelligence edits and versioned comparison data.
 - Job status/result metadata while retained by the control plane.
 - Tenant settings, users, roles, identity providers, team memberships, and project-team mappings.
 - Organization registry plus tenant lineage on artifacts, versions, memberships, mappings, and reset tokens.
-- Tenant-unique project codes and stable project avatar presentation metadata.
+- Tenant-unique project codes and stable project avatar presentation metadata on the project parent.
 - Hashed local passwords and hashed one-time reset tokens; plaintext passwords are never persisted.
 
 Not persisted by the application:
@@ -208,9 +223,10 @@ fast instead of falling back to local memory when Redis is unavailable.
 | API horizontal scaling | Supported for status/rate/capacity; in-flight bytes remain tied to the accepting instance. |
 | Worker crash behavior | In-flight memory-only bytes are lost; job becomes failed after stale timeout. |
 | Durable artifacts | Stored in PostgreSQL. |
+| Project/artifact browsing | Paginated and searchable APIs backed by composite indexes for tenant/archive filters, team access, latest-artifact rollups, and version history ordering. |
 | Production IAM | Trusted OIDC JWT validation and directory synchronization are implemented; provider-specific SSO initiation remains an integration concern. |
 | Tenant isolation | Enforced in identity, settings, teams, project access, archive/restore, traceability context, and analysis jobs. |
-| Project authorization | Owners and assigned-team members see projects; `view_all_projects` and global root provide governed overrides. |
+| Project authorization | Owners and assigned-team members see projects; analysis requires access to the selected project; `view_all_projects` and global root provide governed overrides. |
 
 ## Remaining Enterprise Upgrades
 

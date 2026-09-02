@@ -53,8 +53,12 @@ def build_source_bundle(
         parts.append("Typed source material:\n" + source_text.strip())
 
     file_summaries = []
-    for source_file in source_files or []:
-        file_summaries.append(describe_source_file(source_file))
+    for index, source_file in enumerate(source_files or [], start=1):
+        enriched_source_file = {
+            **source_file,
+            "source_code": source_file.get("source_code") or f"SRC-{index:03d}",
+        }
+        file_summaries.append(describe_source_file(enriched_source_file))
 
     if file_summaries:
         parts.append("Uploaded source materials:\n" + "\n\n".join(file_summaries))
@@ -76,6 +80,9 @@ def build_source_context(
              {
                 "type": "notes",
                 "name": "Typed source material",
+                "source_code": "SRC-TYPED",
+                "content_fingerprint": "",
+                "cache_status": "canonical_text",
                 "metadata": [
                     {"key": "characters", "value": str(len(source_text.strip()))},
                     {"key": "extraction_status", "value": "provided_text"},
@@ -128,11 +135,20 @@ def build_source_context(
             metadata.append(
                 {"key": "content_sha256", "value": str(source_file["content_sha256"])}
             )
+        source_code = f"SRC-{index:03d}"
+        content_fingerprint = str(source_file.get("content_sha256") or "")
 
         source_materials.append(
             {
                 "type": source_type,
                 "name": name,
+                "source_code": source_code,
+                "content_fingerprint": content_fingerprint,
+                "cache_status": (
+                    "raw_bytes_ephemeral_canonical_saved"
+                    if has_embedded_content
+                    else "metadata_only"
+                ),
                 "metadata": metadata,
                 "source_reference": f"source:file:{index}",
             }
@@ -176,11 +192,17 @@ def describe_source_file(source_file: Dict[str, object]) -> str:
     name = str(source_file.get("name") or "unnamed file")
     media_type = str(source_file.get("type") or "application/octet-stream")
     size = source_file.get("size") or 0
+    source_code = str(source_file.get("source_code") or "")
+    content_hash = str(source_file.get("content_sha256") or "")
     extension = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
     content_base64 = source_file.get("content_base64")
     storage_id = source_file.get("storage_id")
 
-    header = f"File: {name}\nType: {media_type}\nSize: {size} bytes"
+    header = (
+        f"Source code: {source_code or 'pending'}\n"
+        f"File: {name}\nType: {media_type}\nSize: {size} bytes"
+        + (f"\nContent fingerprint: {content_hash}" if content_hash else "")
+    )
     prepared_text = str(source_file.get("extracted_text") or "")
     extraction_method = str(source_file.get("extraction_method") or "")
 

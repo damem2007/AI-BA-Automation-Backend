@@ -33,6 +33,7 @@ EXPORT_SECTIONS = [
     {"key": "uat_scenarios", "label": "UAT Scenarios"},
     {"key": "use_cases", "label": "Use Cases"},
     {"key": "context_diagram", "label": "Context Diagram"},
+    {"key": "diagram_artifacts", "label": "Mermaid Diagram Artifacts"},
     {"key": "focus_area_outputs", "label": "Focus Area Outputs"},
     {"key": "data_mapping_matrix", "label": "Data Mapping Matrix"},
     {"key": "swot_analysis", "label": "SWOT Analysis"},
@@ -154,6 +155,16 @@ def render_markdown_value(value: Any, indent: int = 0) -> List[str]:
     if isinstance(value, list):
         lines = []
         for item in value:
+            if isinstance(item, dict) and item.get("mermaid_syntax"):
+                title = item.get("title") or item.get("id") or "Diagram"
+                diagram_type = item.get("diagram_type") or "mermaid"
+                lines.append(f"{prefix}- {title} ({diagram_type})")
+                if item.get("description"):
+                    lines.append(f"{prefix}  - {item['description']}")
+                lines.append(f"{prefix}  ```mermaid")
+                lines.extend(f"{prefix}  {line}" for line in str(item["mermaid_syntax"]).splitlines())
+                lines.append(f"{prefix}  ```")
+                continue
             if isinstance(item, dict):
                 lines.append(f"{prefix}- {summarize_dict(item)}")
                 for key, nested_value in item.items():

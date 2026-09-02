@@ -3,16 +3,28 @@ import base64
 import binascii
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from pydantic import BaseModel
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 from typing import List, Literal, Optional
 
 from app.database import SessionLocal
-from app.models import AnalysisArtifact, ArtifactVersion, ProjectTeam, Team, TeamMembership
+from app.models import (
+    AnalysisArtifact,
+    ArtifactApprovalAssignment,
+    ArtifactVersion,
+    Project,
+    ProjectTeam,
+    Team,
+    TeamMembership,
+    User,
+)
 from app.schemas.auth import CurrentUser
 from app.schemas.analysis import (
+    ProjectCreateRequest,
+    ProjectUpdateRequest,
     RELATIONSHIP_TYPES,
     RefinementRequest,
     TranscriptRequest,
@@ -37,11 +49,13 @@ from app.services.source_uploads import (
     staged_upload_metrics,
 )
 from app.services.project_generator import (
+    AVATAR_COLORS,
     generate_artifact_avatar,
     generate_project_code,
     normalize_project_code,
 )
 from datetime import datetime, timezone
+
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
@@ -53,6 +67,20 @@ class ExportRequest(BaseModel):
 
 class ActivityRecommendationRequest(BaseModel):
     activity_keys: List[str] = []
+
+
+class ArtifactApprovalCreateRequest(BaseModel):
+    assigned_user_id: str
+    approval_level: str = "business"
+    due_date: str = ""
+    notes: str = ""
+
+
+class ArtifactApprovalUpdateRequest(BaseModel):
+    status: Optional[Literal["pending", "approved", "changes_requested", "rejected", "cancelled"]] = None
+    notes: Optional[str] = None
+    due_date: Optional[str] = None
+    approval_level: Optional[str] = None
 
 
 def activity_labels_for_keys(activity_keys: List[str]) -> List[str]:
@@ -121,7 +149,10 @@ def preserve_cumulative_intelligence(previous_analysis: dict, updated_analysis: 
         "delivery_analysis",
         "process_intelligence",
         "test_intelligence",
+        "requirements_quality",
         "impact_analysis",
+        "approval_governance",
+        "diagram_artifacts",
     ):
         cumulative[section] = merge_incremental_value(
             (previous_analysis or {}).get(section) or {},
@@ -600,13 +631,16 @@ def serialize_artifact_response(
     selected_phase: Optional[int] = None,
     db: Optional[Session] = None,
 ) -> dict:
-    teams = artifact_team_summaries(db, artifact.id) if db else []
+    teams = project_team_summaries(db, artifact.project_id) if db and artifact.project_id else []
+    project = project_for_artifact(db, artifact) if db else None
     return {
         "id": artifact.id,
-        "project_name": artifact.project_name,
-        "project_code": artifact.project_code,
-        "avatar_initials": artifact.avatar_initials,
-        "avatar_color": artifact.avatar_color,
+        "project_id": artifact.project_id,
+        "project_name": project.project_name if project else "",
+        "project_code": project.project_code if project else "",
+        "avatar_initials": project.avatar_initials if project else "",
+        "avatar_color": project.avatar_color if project else "",
+        "signoff_configuration": project.signoff_configuration if project and project.signoff_configuration else default_project_signoff_configuration(),
         "project_type": artifact.project_type,
         "company_name": artifact.company_name,
         "industry": artifact.industry,
@@ -621,7 +655,6 @@ def serialize_artifact_response(
         "selected_outputs": artifact.selected_outputs,
         "source_files": artifact.source_files,
         "country": artifact.country,
-        "team_id": artifact.team_id,
         "owner_user_id": artifact.owner_user_id,
         "is_archived": artifact.is_archived,
         "teams": teams,
@@ -632,21 +665,289 @@ def serialize_artifact_response(
     }
 
 
-def artifact_team_summaries(db: Session, artifact_id: int) -> list[dict]:
+def serialize_artifact_summary(db: Session, artifact: AnalysisArtifact) -> dict:
+    project = project_for_artifact(db, artifact)
+    teams_by_project = project_team_summaries_map(db, [artifact.project_id] if artifact.project_id else [])
+    return serialize_artifact_summary_with_context(
+        artifact,
+        project,
+        teams_by_project.get(artifact.project_id, []),
+    )
+
+
+def serialize_artifact_summary_with_context(
+    artifact: AnalysisArtifact,
+    project: Optional[Project],
+    teams: Optional[list[dict]] = None,
+) -> dict:
+    return {
+        "id": artifact.id,
+        "project_id": artifact.project_id,
+        "project_name": project.project_name if project else "",
+        "project_code": project.project_code if project else "",
+        "avatar_initials": project.avatar_initials if project else "",
+        "avatar_color": project.avatar_color if project else "",
+        "signoff_configuration": project.signoff_configuration if project and project.signoff_configuration else default_project_signoff_configuration(),
+        "project_type": artifact.project_type,
+        "company_name": artifact.company_name,
+        "industry": artifact.industry,
+        "domain": artifact.domain,
+        "analysis_focus_key": artifact.analysis_focus_key,
+        "analysis_focus_chapter": artifact.analysis_focus_chapter,
+        "analysis_focus_area": artifact.analysis_focus_area,
+        "selected_activity_keys": artifact.selected_activity_keys,
+        "selected_activity_labels": artifact.selected_activity_labels,
+        "selected_techniques": artifact.selected_techniques,
+        "infer_additional_techniques": artifact.infer_additional_techniques,
+        "selected_outputs": artifact.selected_outputs,
+        "source_files": artifact.source_files,
+        "country": artifact.country,
+        "owner_user_id": artifact.owner_user_id,
+        "is_archived": artifact.is_archived,
+        "teams": teams or [],
+        "created_at": artifact.created_at,
+    }
+
+
+def project_for_artifact(db: Session, artifact: AnalysisArtifact) -> Optional[Project]:
+    if not artifact.project_id:
+        return None
+    return db.query(Project).filter(Project.id == artifact.project_id).first()
+
+
+def project_team_summaries(db: Session, project_id: int) -> list[dict]:
+    return project_team_summaries_map(db, [project_id]).get(project_id, [])
+
+
+def project_team_summaries_map(db: Session, project_ids: list[int]) -> dict[int, list[dict]]:
+    if not project_ids:
+        return {}
     teams = db.query(Team).join(ProjectTeam, ProjectTeam.team_id == Team.id).filter(
-        ProjectTeam.artifact_id == artifact_id,
+        ProjectTeam.project_id.in_(project_ids),
         Team.is_archived.is_(False),
-    ).order_by(Team.name.asc()).all()
-    palette = ["#147d92", "#7c3aed", "#b45309", "#047857", "#be123c", "#3f6212"]
+    ).with_entities(ProjectTeam.project_id, Team).order_by(Team.name.asc()).all()
+    palette = AVATAR_COLORS
     icons = ["users", "blocks", "workflow", "layers", "briefcase", "network"]
+    grouped: dict[int, list[dict]] = {project_id: [] for project_id in project_ids}
+    for project_id, team in teams:
+        grouped.setdefault(project_id, []).append(
+            {
+                "id": team.id,
+                "name": team.name,
+                "color": palette[team.id % len(palette)],
+                "icon": icons[team.id % len(icons)],
+            }
+        )
+    return grouped
+
+
+def serialize_project_response(db: Session, project: Project) -> dict:
+    teams_by_project = project_team_summaries_map(db, [project.id])
+    counts, latest_artifacts = project_artifact_rollups(db, [project.id])
+    return serialize_project_response_with_context(
+        project,
+        teams_by_project.get(project.id, []),
+        counts.get(project.id, 0),
+        latest_artifacts.get(project.id),
+    )
+
+
+def default_project_signoff_configuration() -> dict:
+    return {
+        "requirements": True,
+        "uat_test": True,
+        "impact_analysis": True,
+        "traceability": True,
+        "process_intelligence": True,
+        "enterprise_intelligence": True,
+        "executive_translation": True,
+        "governance": True,
+        "diagrams_models": False,
+        "artifact_signoff": True,
+    }
+
+
+def serialize_project_response_with_context(
+    project: Project,
+    teams: list[dict],
+    artifact_count: int = 0,
+    latest_artifact: Optional[AnalysisArtifact] = None,
+) -> dict:
+    return {
+        "id": project.id,
+        "project_name": project.project_name,
+        "project_code": project.project_code,
+        "avatar_initials": project.avatar_initials,
+        "avatar_color": project.avatar_color,
+        "project_type": project.project_type,
+        "company_name": project.company_name,
+        "industry": project.industry,
+        "domain": project.domain,
+        "initiative_type": project.initiative_type,
+        "country": project.country,
+        "signoff_configuration": project.signoff_configuration or default_project_signoff_configuration(),
+        "owner_user_id": project.owner_user_id,
+        "tenant_id": project.tenant_id,
+        "is_archived": project.is_archived,
+        "created_at": project.created_at,
+        "teams": teams,
+        "artifact_count": artifact_count,
+        "latest_artifact_id": latest_artifact.id if latest_artifact else None,
+        "current_version_id": latest_artifact.current_version_id if latest_artifact else None,
+    }
+
+
+def serialize_project_responses(db: Session, projects: list[Project]) -> list[dict]:
+    project_ids = [project.id for project in projects]
+    teams_by_project = project_team_summaries_map(db, project_ids)
+    counts, latest_artifacts = project_artifact_rollups(db, project_ids)
+    return [
+        serialize_project_response_with_context(
+            project,
+            teams_by_project.get(project.id, []),
+            counts.get(project.id, 0),
+            latest_artifacts.get(project.id),
+        )
+        for project in projects
+    ]
+
+
+def project_artifact_rollups(
+    db: Session,
+    project_ids: list[int],
+) -> tuple[dict[int, int], dict[int, AnalysisArtifact]]:
+    if not project_ids:
+        return {}, {}
+
+    active_filters = (
+        AnalysisArtifact.project_id.in_(project_ids),
+        AnalysisArtifact.is_deleted.is_(False),
+        AnalysisArtifact.is_archived.is_(False),
+    )
+    count_rows = (
+        db.query(AnalysisArtifact.project_id, func.count(AnalysisArtifact.id))
+        .filter(*active_filters)
+        .group_by(AnalysisArtifact.project_id)
+        .all()
+    )
+    counts = {project_id: int(count) for project_id, count in count_rows}
+
+    latest_created_at = (
+        db.query(
+            AnalysisArtifact.project_id.label("project_id"),
+            func.max(AnalysisArtifact.created_at).label("latest_created_at"),
+        )
+        .filter(*active_filters)
+        .group_by(AnalysisArtifact.project_id)
+        .subquery()
+    )
+    latest_rows = (
+        db.query(AnalysisArtifact)
+        .join(
+            latest_created_at,
+            and_(
+                AnalysisArtifact.project_id == latest_created_at.c.project_id,
+                AnalysisArtifact.created_at == latest_created_at.c.latest_created_at,
+            ),
+        )
+        .order_by(AnalysisArtifact.project_id.asc(), AnalysisArtifact.id.desc())
+        .all()
+    )
+    latest_artifacts: dict[int, AnalysisArtifact] = {}
+    for artifact in latest_rows:
+        latest_artifacts.setdefault(artifact.project_id, artifact)
+    return counts, latest_artifacts
+
+
+def paginate_query(query, page: int, page_size: int) -> tuple[list, dict]:
+    total = query.order_by(None).count()
+    items = query.offset((page - 1) * page_size).limit(page_size).all()
+    return items, {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+    }
+
+
+def paginated_response(items: list, meta: dict) -> dict:
+    return {**meta, "items": items}
+
+
+def apply_project_search(query, search: Optional[str]):
+    if not search or not search.strip():
+        return query
+    pattern = f"%{search.strip()}%"
+    return query.filter(
+        or_(
+            Project.project_name.ilike(pattern),
+            Project.project_code.ilike(pattern),
+            Project.domain.ilike(pattern),
+            Project.industry.ilike(pattern),
+            Project.company_name.ilike(pattern),
+        )
+    )
+
+
+def apply_artifact_search(query, search: Optional[str]):
+    if not search or not search.strip():
+        return query
+    pattern = f"%{search.strip()}%"
+    # Search spans the normalized project parent plus the artifact's own analysis metadata.
+    return query.join(Project, Project.id == AnalysisArtifact.project_id).filter(
+        or_(
+            Project.project_name.ilike(pattern),
+            Project.project_code.ilike(pattern),
+            Project.domain.ilike(pattern),
+            Project.industry.ilike(pattern),
+            Project.company_name.ilike(pattern),
+            AnalysisArtifact.domain.ilike(pattern),
+            AnalysisArtifact.industry.ilike(pattern),
+            AnalysisArtifact.analysis_focus_area.ilike(pattern),
+            AnalysisArtifact.analysis_focus_chapter.ilike(pattern),
+        )
+    )
+
+
+def build_recent_artifact_summaries(db: Session, artifacts: list[AnalysisArtifact]) -> list[dict]:
+    project_ids = list({artifact.project_id for artifact in artifacts if artifact.project_id})
+    projects_by_id = {
+        project.id: project
+        for project in db.query(Project).filter(Project.id.in_(project_ids)).all()
+    } if project_ids else {}
     return [
         {
-            "id": team.id,
-            "name": team.name,
-            "color": palette[team.id % len(palette)],
-            "icon": icons[team.id % len(icons)],
+            "id": artifact.id,
+            "project_name": projects_by_id.get(artifact.project_id).project_name if projects_by_id.get(artifact.project_id) else "",
+            "project_code": projects_by_id.get(artifact.project_id).project_code if projects_by_id.get(artifact.project_id) else "",
+            "avatar_initials": projects_by_id.get(artifact.project_id).avatar_initials if projects_by_id.get(artifact.project_id) else "",
+            "avatar_color": projects_by_id.get(artifact.project_id).avatar_color if projects_by_id.get(artifact.project_id) else "",
+            "domain": artifact.domain,
+            "created_at": artifact.created_at,
+            "phase": get_analysis_phase(artifact.analysis_json or {}),
         }
-        for team in teams
+        for artifact in artifacts
+    ]
+
+
+def enrich_source_materials_with_project_context(
+    source_materials: list[dict],
+    artifact: AnalysisArtifact,
+    project: Optional[Project],
+) -> list[dict]:
+    # Internal sources now carry the same context we will later need for external systems
+    # such as Confluence or SharePoint: where the evidence came from and which project used it.
+    return [
+        {
+            **source,
+            "artifact_id": artifact.id,
+            "project_id": artifact.project_id,
+            "project_name": project.project_name if project else "",
+            "project_code": project.project_code if project else "",
+            "source_system": source.get("source_system") or "ba_optimization",
+            "source_container": source.get("source_container") or "analysis_artifact",
+        }
+        for source in source_materials
     ]
 
 def get_db():
@@ -669,12 +970,41 @@ def accessible_artifacts_query(
         query = query.filter(AnalysisArtifact.tenant_id == user.tenant_id)
     if not user.is_global and "view_all_projects" not in user.permissions:
         team_ids = db.query(TeamMembership.team_id).filter(TeamMembership.user_id == user.id)
-        project_ids = db.query(ProjectTeam.artifact_id).filter(ProjectTeam.team_id.in_(team_ids))
+        project_ids = db.query(ProjectTeam.project_id).filter(ProjectTeam.team_id.in_(team_ids))
         query = query.filter(
             (AnalysisArtifact.owner_user_id == user.id)
-            | (AnalysisArtifact.id.in_(project_ids))
+            | (AnalysisArtifact.project_id.in_(project_ids))
         )
     return query
+
+
+def accessible_projects_query(
+    db: Session,
+    user: CurrentUser,
+    include_archived: bool = False,
+):
+    query = db.query(Project).filter(Project.is_deleted.is_(False))
+    if not include_archived:
+        query = query.filter(Project.is_archived.is_(False))
+    if not user.is_global:
+        query = query.filter(Project.tenant_id == user.tenant_id)
+    if not user.is_global and "view_all_projects" not in user.permissions:
+        team_ids = db.query(TeamMembership.team_id).filter(TeamMembership.user_id == user.id)
+        project_ids = db.query(ProjectTeam.project_id).filter(ProjectTeam.team_id.in_(team_ids))
+        query = query.filter((Project.owner_user_id == user.id) | (Project.id.in_(project_ids)))
+    return query
+
+
+def get_accessible_project(
+    db: Session,
+    project_id: int,
+    user: CurrentUser,
+    include_archived: bool = False,
+) -> Project:
+    project = accessible_projects_query(db, user, include_archived).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
 
 
 def get_accessible_artifact(
@@ -689,6 +1019,88 @@ def get_accessible_artifact(
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact not found")
     return artifact
+
+
+def serialize_approval_assignment(db: Session, assignment: ArtifactApprovalAssignment) -> dict:
+    assigned = db.query(User).filter(User.id == assignment.assigned_user_id).first()
+    requested_by = db.query(User).filter(User.id == assignment.requested_by_user_id).first()
+    return {
+        "id": assignment.id,
+        "artifact_id": assignment.artifact_id,
+        "tenant_id": assignment.tenant_id,
+        "assigned_user_id": assignment.assigned_user_id,
+        "assigned_user_name": assigned.name if assigned else "",
+        "assigned_user_email": assigned.email if assigned else "",
+        "requested_by_user_id": assignment.requested_by_user_id,
+        "requested_by_name": requested_by.name if requested_by else "",
+        "approval_level": assignment.approval_level,
+        "status": assignment.status,
+        "due_date": assignment.due_date,
+        "notes": assignment.notes,
+        "created_at": assignment.created_at,
+        "updated_at": assignment.updated_at,
+    }
+
+
+def get_artifact_approval_assignment(
+    db: Session,
+    artifact: AnalysisArtifact,
+    assignment_id: int,
+) -> ArtifactApprovalAssignment:
+    assignment = db.query(ArtifactApprovalAssignment).filter(
+        ArtifactApprovalAssignment.id == assignment_id,
+        ArtifactApprovalAssignment.artifact_id == artifact.id,
+    ).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Approval assignment not found")
+    return assignment
+
+
+def artifact_assigned_team_ids(db: Session, artifact_id: int) -> set[int]:
+    artifact = db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
+    if not artifact or not artifact.project_id:
+        return set()
+    return project_assigned_team_ids(db, artifact.project_id)
+
+
+def project_assigned_team_ids(db: Session, project_id: int) -> set[int]:
+    return {
+        row[0]
+        for row in db.query(ProjectTeam.team_id)
+        .filter(ProjectTeam.project_id == project_id)
+        .all()
+    }
+
+
+def require_project_analysis_access(
+    db: Session,
+    project_id: int,
+    user: CurrentUser,
+) -> Project:
+    project = get_accessible_project(db, project_id, user)
+    if user.is_global:
+        return project
+    assigned_team_ids = project_assigned_team_ids(db, project.id)
+    if not assigned_team_ids:
+        raise HTTPException(
+            status_code=403,
+            detail="Project analysis requires at least one assigned team",
+        )
+    member_team_ids = {
+        row[0]
+        for row in db.query(TeamMembership.team_id)
+        .filter(
+            TeamMembership.user_id == user.id,
+            TeamMembership.team_id.in_(assigned_team_ids),
+        )
+        .all()
+    }
+    if not member_team_ids:
+        raise HTTPException(
+            status_code=403,
+            detail="Only members of an assigned project team can run analysis for this project",
+        )
+    return project
 
 
 def validate_team_assignment(db: Session, team_ids: list[int], user: CurrentUser) -> list[Team]:
@@ -709,7 +1121,7 @@ def validate_team_assignment(db: Session, team_ids: list[int], user: CurrentUser
                 status_code=409,
                 detail=f"{team.name} is limited to one project. Enable multi-project work in Team settings.",
             )
-    if user.is_global:
+    if user.is_global or "assign_project_teams" in user.permissions:
         return teams
     member_team_ids = {
         value[0]
@@ -735,16 +1147,16 @@ def resolve_project_identity(
             status_code=422,
             detail="Project code must contain 3 to 32 letters, numbers, or hyphens",
         )
-    if project_code and db.query(AnalysisArtifact).filter(
-        AnalysisArtifact.tenant_id == tenant_id,
-        AnalysisArtifact.project_code == project_code,
+    if project_code and db.query(Project).filter(
+        Project.tenant_id == tenant_id,
+        Project.project_code == project_code,
     ).first():
         raise HTTPException(status_code=409, detail="Project code already exists in this organization")
     while not project_code:
         candidate = generate_project_code(project_name)
-        if not db.query(AnalysisArtifact).filter(
-            AnalysisArtifact.tenant_id == tenant_id,
-            AnalysisArtifact.project_code == candidate,
+        if not db.query(Project).filter(
+            Project.tenant_id == tenant_id,
+            Project.project_code == candidate,
         ).first():
             project_code = candidate
     avatar_color, avatar_initials = generate_artifact_avatar(project_name)
@@ -753,18 +1165,30 @@ def resolve_project_identity(
 
 def run_initial_analysis(request: TranscriptRequest, db: Session, actor: CurrentUser):
     validate_analysis_request(request)
+    target_project = (
+        require_project_analysis_access(db, request.project_id, actor)
+        if request.project_id
+        else None
+    )
     source_text = request.source_text if request.source_text is not None else request.transcript
+    project_name = target_project.project_name if target_project else request.project_name
+    project_type = target_project.project_type if target_project else request.project_type
+    company_name = target_project.company_name if target_project else request.company_name
+    industry = target_project.industry if target_project else request.industry
+    domain = target_project.domain if target_project else request.domain
+    initiative_type = target_project.initiative_type if target_project else request.initiative_type
+    country = target_project.country if target_project else request.country
 
     try:
         # Return controlled API errors so upload failures are visible to the frontend.
         analysis=  analyze_transcript(
-            project_name=request.project_name,
+            project_name=project_name,
             source_text=source_text,
-            project_type=request.project_type,
-            company_name=request.company_name,
-            industry=request.industry,
-            domain=request.domain,
-            initiative_type=request.initiative_type,
+            project_type=project_type,
+            company_name=company_name,
+            industry=industry,
+            domain=domain,
+            initiative_type=initiative_type,
             analysis_focus_key=request.analysis_focus_key,
             analysis_focus_chapter=request.analysis_focus_chapter,
             analysis_focus_area=request.analysis_focus_area,
@@ -778,9 +1202,12 @@ def run_initial_analysis(request: TranscriptRequest, db: Session, actor: Current
                 for source_file in request.source_files or []
             ],
             strategic_analysis_enabled=request.strategic_analysis_enabled,
-            country=request.country,
+            country=country,
             source_intent=request.source_intent,
             source_subtype=request.source_subtype,
+            model_provider=request.model_provider,
+            reasoning_model=request.reasoning_model,
+            extraction_model=request.extraction_model,
         )
     except Exception as error:
         for source_file in request.source_files or []:
@@ -816,46 +1243,67 @@ def run_initial_analysis(request: TranscriptRequest, db: Session, actor: Current
     )
     initial_orchestration.setdefault("rerun_warnings", [])
 
-    selected_team_ids = list(dict.fromkeys(request.team_ids or ([request.team_id] if request.team_id else [])))
-    project_code, avatar_initials, avatar_color = resolve_project_identity(
-        db, request.project_name, request.project_code, actor.tenant_id
-    )
+    source_file_metadata = [
+        {
+            key: value
+            for key, value in source.items()
+            if key not in {"content_base64", "storage_id", "extracted_text"}
+        }
+        for source in (
+            analysis_payload.get("source_context", {}).get("source_materials") or []
+        )
+        if source.get("source_reference") != "source:typed"
+    ]
+    if target_project:
+        project = target_project
+    else:
+        selected_team_ids = list(dict.fromkeys(request.team_ids or ([request.team_id] if request.team_id else [])))
+        project_code, avatar_initials, avatar_color = resolve_project_identity(
+            db, request.project_name, request.project_code, actor.tenant_id
+        )
+        project = Project(
+            project_name=project_name,
+            project_code=project_code,
+            avatar_initials=avatar_initials,
+            avatar_color=avatar_color,
+            project_type=project_type,
+            company_name=company_name,
+            industry=industry,
+            domain=domain,
+            initiative_type=initiative_type,
+            country=country,
+            owner_user_id=actor.id,
+            tenant_id=actor.tenant_id,
+        )
+        db.add(project)
+        db.flush()
+        for team_id in selected_team_ids:
+            db.add(ProjectTeam(project_id=project.id, team_id=team_id, tenant_id=actor.tenant_id, assigned_by=actor.id))
+
     artifact = AnalysisArtifact(
-        project_name=request.project_name,
-        project_code=project_code,
-        avatar_initials=avatar_initials,
-        avatar_color=avatar_color,
-        project_type=request.project_type,
-        company_name=request.company_name,
-        industry=request.industry,
-        domain=request.domain,
-        analysis_focus_key=request.analysis_focus_key,
-        analysis_focus_chapter=request.analysis_focus_chapter,
-        analysis_focus_area=request.analysis_focus_area,
-        selected_activity_keys=request.selected_activity_keys,
-        selected_activity_labels=request.selected_activity_labels,
-        selected_techniques=request.selected_techniques,
-        infer_additional_techniques=request.infer_additional_techniques,
-        selected_outputs=request.selected_outputs,
-        source_files=[
-            {
-                "name": source_file.name,
-                "type": source_file.type,
-                "size": source_file.size,
-            }
-            for source_file in request.source_files or []
-        ],
-        country=request.country,
-        transcript=source_text,
-        analysis_json=analysis_payload,
-        owner_user_id=actor.id,
-        team_id=selected_team_ids[0] if selected_team_ids else None,
-        tenant_id=actor.tenant_id,
+            project_id=project.id,
+            project_type=project.project_type,
+            company_name=project.company_name,
+            industry=project.industry,
+            domain=project.domain,
+            analysis_focus_key=request.analysis_focus_key,
+            analysis_focus_chapter=request.analysis_focus_chapter,
+            analysis_focus_area=request.analysis_focus_area,
+            selected_activity_keys=request.selected_activity_keys,
+            selected_activity_labels=request.selected_activity_labels,
+            selected_techniques=request.selected_techniques,
+            infer_additional_techniques=request.infer_additional_techniques,
+            selected_outputs=request.selected_outputs,
+            source_files=source_file_metadata,
+            country=project.country,
+            transcript=source_text,
+            analysis_json=analysis_payload,
+            owner_user_id=actor.id,
+            team_id=None,
+            tenant_id=project.tenant_id,
     )
     db.add(artifact)
     db.flush()
-    for team_id in selected_team_ids:
-        db.add(ProjectTeam(artifact_id=artifact.id, team_id=team_id, tenant_id=actor.tenant_id, assigned_by=actor.id))
     db.commit()
     db.refresh(artifact)
     artifact.analysis_json = {
@@ -950,8 +1398,11 @@ def generate_analysis(
     db: Session = Depends(get_db),
 ):
     validate_analysis_request(request)
-    selected_team_ids = list(dict.fromkeys(request.team_ids or ([request.team_id] if request.team_id else [])))
-    validate_team_assignment(db, selected_team_ids, user)
+    if request.project_id:
+        require_project_analysis_access(db, request.project_id, user)
+    else:
+        selected_team_ids = list(dict.fromkeys(request.team_ids or ([request.team_id] if request.team_id else [])))
+        validate_team_assignment(db, selected_team_ids, user)
     client_host = http_request.client.host if http_request.client else "unknown"
     client_key = f"{user.tenant_id}:{user.subject}:{client_host}"
     request_snapshot, staged_ids = stage_request_source_files(request)
@@ -997,45 +1448,121 @@ def get_analysis_limits():
     return {**public_limits(), **analysis_jobs.metrics(), **staged_upload_metrics()}
 
 
-@router.get("/analysis-artifacts")
-def get_artifacts(
+@router.get("/projects")
+def get_projects(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    q: Optional[str] = Query(None),
     user: CurrentUser = Depends(require_permission("view_artifacts")),
     db: Session = Depends(get_db),
 ):
-    artifacts = (
-        accessible_artifacts_query(db, user)
-        .order_by(AnalysisArtifact.created_at.desc())
-        .all()
+    query = apply_project_search(accessible_projects_query(db, user), q).order_by(Project.created_at.desc())
+    projects, meta = paginate_query(query, page, page_size)
+    return paginated_response(serialize_project_responses(db, projects), meta)
+
+
+@router.post("/projects", status_code=status.HTTP_201_CREATED)
+def create_project(
+    request: ProjectCreateRequest,
+    user: CurrentUser = Depends(require_permission("create_analysis")),
+    db: Session = Depends(get_db),
+):
+    selected_team_ids = list(dict.fromkeys(request.team_ids or ([request.team_id] if request.team_id else [])))
+    if not selected_team_ids:
+        raise HTTPException(status_code=422, detail="Assign at least one team before creating a project")
+    validate_team_assignment(db, selected_team_ids, user)
+    project_code, avatar_initials, avatar_color = resolve_project_identity(
+        db, request.project_name, request.project_code, user.tenant_id
     )
-    return[
+    project = Project(
+        project_name=request.project_name,
+        project_code=project_code,
+        avatar_initials=avatar_initials,
+        avatar_color=avatar_color,
+        project_type=request.project_type,
+        company_name=request.company_name,
+        industry=request.industry,
+        domain=request.domain,
+        initiative_type=request.initiative_type,
+        country=request.country,
+        signoff_configuration=request.signoff_configuration or default_project_signoff_configuration(),
+        owner_user_id=user.id,
+        tenant_id=user.tenant_id,
+    )
+    db.add(project)
+    db.flush()
+    for team_id in selected_team_ids:
+        db.add(
+            ProjectTeam(
+                project_id=project.id,
+                team_id=team_id,
+                tenant_id=user.tenant_id,
+                assigned_by=user.id,
+            )
+        )
+    db.commit()
+    db.refresh(project)
+    return serialize_project_response(db, project)
+
+
+@router.patch("/projects/{project_id}")
+def update_project(
+    project_id: int,
+    request: ProjectUpdateRequest,
+    user: CurrentUser = Depends(require_permission("manage_projects")),
+    db: Session = Depends(get_db),
+):
+    project = get_accessible_project(db, project_id, user)
+    updates = request.model_dump(exclude_unset=True)
+    if "project_name" in updates and not (updates["project_name"] or "").strip():
+        raise HTTPException(status_code=422, detail="Project name is required")
+    for field, value in updates.items():
+        setattr(project, field, value)
+    project.updated_at = datetime.now(timezone.utc)
+    db.query(AnalysisArtifact).filter(AnalysisArtifact.project_id == project.id).update(
         {
-            "id": artifact.id,
-            "project_name": artifact.project_name,
-            "project_code": artifact.project_code,
-            "avatar_initials": artifact.avatar_initials,
-            "avatar_color": artifact.avatar_color,
-            "project_type": artifact.project_type,
-            "company_name": artifact.company_name,
-            "industry": artifact.industry,
-            "domain": artifact.domain,
-            "analysis_focus_key": artifact.analysis_focus_key,
-            "analysis_focus_chapter": artifact.analysis_focus_chapter,
-            "analysis_focus_area": artifact.analysis_focus_area,
-            "selected_activity_keys": artifact.selected_activity_keys,
-            "selected_activity_labels": artifact.selected_activity_labels,
-            "selected_techniques": artifact.selected_techniques,
-            "infer_additional_techniques": artifact.infer_additional_techniques,
-            "selected_outputs": artifact.selected_outputs,
-            "source_files": artifact.source_files,
-            "country": artifact.country,
-            "team_id": artifact.team_id,
-            "owner_user_id": artifact.owner_user_id,
-            "is_archived": artifact.is_archived,
-            "teams": artifact_team_summaries(db, artifact.id),
-            "created_at": artifact.created_at,
-        }
-        for artifact in artifacts
-    ]
+            AnalysisArtifact.project_type: project.project_type,
+            AnalysisArtifact.company_name: project.company_name,
+            AnalysisArtifact.industry: project.industry,
+            AnalysisArtifact.domain: project.domain,
+            AnalysisArtifact.country: project.country,
+        },
+        synchronize_session=False,
+    )
+    db.commit()
+    db.refresh(project)
+    return serialize_project_response(db, project)
+
+
+@router.get("/analysis-artifacts")
+def get_artifacts(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    q: Optional[str] = Query(None),
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
+    db: Session = Depends(get_db),
+):
+    query = apply_artifact_search(accessible_artifacts_query(db, user), q).order_by(
+        AnalysisArtifact.created_at.desc()
+    )
+    artifacts, meta = paginate_query(query, page, page_size)
+    project_ids = list({artifact.project_id for artifact in artifacts if artifact.project_id})
+    projects_by_id = {
+        project.id: project
+        for project in db.query(Project).filter(Project.id.in_(project_ids)).all()
+    } if project_ids else {}
+    teams_by_project = project_team_summaries_map(db, project_ids)
+    return paginated_response(
+        [
+            serialize_artifact_summary_with_context(
+                artifact,
+                projects_by_id.get(artifact.project_id),
+                teams_by_project.get(artifact.project_id, []),
+            )
+            for artifact in artifacts
+        ],
+        meta,
+    )
 
 
 @router.get("/analysis-artifacts-overview")
@@ -1044,7 +1571,15 @@ def get_artifacts_overview(
     db: Session = Depends(get_db),
 ):
     artifacts = accessible_artifacts_query(db, user).order_by(AnalysisArtifact.created_at.desc()).all()
-    versions = db.query(ArtifactVersion).all()
+    projects_count = accessible_projects_query(db, user).count()
+    artifact_ids = [artifact.id for artifact in artifacts]
+    versions_count = (
+        db.query(func.count(ArtifactVersion.id))
+        .filter(ArtifactVersion.artifact_id.in_(artifact_ids))
+        .scalar()
+        if artifact_ids
+        else 0
+    )
     total_requirements = 0
     total_risks = 0
     total_open_questions = 0
@@ -1065,9 +1600,9 @@ def get_artifacts_overview(
         domain_counts[domain] = domain_counts.get(domain, 0) + 1
 
     return {
-        "total_projects": len({artifact.project_name for artifact in artifacts}),
+        "total_projects": projects_count,
         "total_artifacts": len(artifacts),
-        "total_versions": len(versions),
+        "total_versions": versions_count,
         "total_requirements": total_requirements,
         "total_risks": total_risks,
         "total_open_questions": total_open_questions,
@@ -1076,19 +1611,7 @@ def get_artifacts_overview(
             {"name": name, "count": count}
             for name, count in sorted(domain_counts.items(), key=lambda item: item[1], reverse=True)
         ],
-        "recent_artifacts": [
-            {
-                "id": artifact.id,
-                "project_name": artifact.project_name,
-                "project_code": artifact.project_code,
-                "avatar_initials": artifact.avatar_initials,
-                "avatar_color": artifact.avatar_color,
-                "domain": artifact.domain,
-                "created_at": artifact.created_at,
-                "phase": get_analysis_phase(artifact.analysis_json or {}),
-            }
-            for artifact in artifacts[:6]
-        ],
+        "recent_artifacts": build_recent_artifact_summaries(db, artifacts[:6]),
     }
 
 @router.get("/analysis-context/focus-areas")
@@ -1119,6 +1642,106 @@ def get_artifact(
     response = serialize_artifact_response(artifact, selected_analysis, selected_phase, db)
     response["transcript"] = artifact.transcript
     return response
+
+
+@router.get("/analysis-artifacts/{artifact_id}/approvals")
+def get_artifact_approvals(
+    artifact_id: int,
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
+    db: Session = Depends(get_db),
+):
+    artifact = get_accessible_artifact(db, artifact_id, user)
+    assignments = db.query(ArtifactApprovalAssignment).filter(
+        ArtifactApprovalAssignment.artifact_id == artifact.id
+    ).order_by(ArtifactApprovalAssignment.created_at.desc()).all()
+    return [serialize_approval_assignment(db, assignment) for assignment in assignments]
+
+
+@router.get("/analysis-artifacts/{artifact_id}/approval-candidates")
+def get_artifact_approval_candidates(
+    artifact_id: int,
+    user: CurrentUser = Depends(require_permission("view_artifacts")),
+    db: Session = Depends(get_db),
+):
+    artifact = get_accessible_artifact(db, artifact_id, user)
+    team_ids = project_assigned_team_ids(db, artifact.project_id)
+    query = db.query(User).filter(
+        User.is_archived.is_(False),
+        User.is_active.is_(True),
+    )
+    if not user.is_global:
+        query = query.filter(User.tenant_id == user.tenant_id)
+    if team_ids:
+        query = query.join(TeamMembership, TeamMembership.user_id == User.id).filter(
+            TeamMembership.team_id.in_(team_ids)
+        )
+    users = query.order_by(User.name.asc()).all()
+    return [
+        {
+            "id": candidate.id,
+            "name": candidate.name,
+            "email": candidate.email,
+            "username": candidate.username,
+            "tenant_id": candidate.tenant_id,
+        }
+        for candidate in users
+    ]
+
+
+@router.post("/analysis-artifacts/{artifact_id}/approvals", status_code=status.HTTP_201_CREATED)
+def create_artifact_approval(
+    artifact_id: int,
+    request: ArtifactApprovalCreateRequest,
+    user: CurrentUser = Depends(require_permission("approve_requirements")),
+    db: Session = Depends(get_db),
+):
+    artifact = get_accessible_artifact(db, artifact_id, user)
+    assignee = db.query(User).filter(
+        User.id == request.assigned_user_id,
+        User.is_archived.is_(False),
+    ).first()
+    if not assignee or (not user.is_global and assignee.tenant_id != user.tenant_id):
+        raise HTTPException(status_code=404, detail="Assignee not found")
+    assignment = ArtifactApprovalAssignment(
+        artifact_id=artifact.id,
+        tenant_id=artifact.tenant_id,
+        assigned_user_id=assignee.id,
+        requested_by_user_id=user.id,
+        approval_level=(request.approval_level or "business").strip() or "business",
+        due_date=request.due_date or "",
+        notes=request.notes or "",
+    )
+    db.add(assignment)
+    db.commit()
+    db.refresh(assignment)
+    return serialize_approval_assignment(db, assignment)
+
+
+@router.patch("/analysis-artifacts/{artifact_id}/approvals/{approval_id}")
+def update_artifact_approval(
+    artifact_id: int,
+    approval_id: int,
+    request: ArtifactApprovalUpdateRequest,
+    user: CurrentUser = Depends(require_permission("approve_requirements")),
+    db: Session = Depends(get_db),
+):
+    artifact = get_accessible_artifact(db, artifact_id, user)
+    assignment = get_artifact_approval_assignment(db, artifact, approval_id)
+    if (
+        not user.is_global
+        and assignment.assigned_user_id != user.id
+        and assignment.requested_by_user_id != user.id
+        and "manage_projects" not in user.permissions
+    ):
+        raise HTTPException(status_code=403, detail="Approval owner, assignee, or manager access is required")
+    updates = request.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        if value is not None:
+            setattr(assignment, field, value)
+    assignment.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(assignment)
+    return serialize_approval_assignment(db, assignment)
 
 
 @router.post("/analysis-artifacts/{artifact_id}/refine")
@@ -1218,8 +1841,10 @@ def refine_artifact(
     ]
 
     try:
+        previous_project_metadata = previous_analysis.get("project_metadata") or {}
+        project = project_for_artifact(db, artifact)
         analysis = analyze_transcript(
-            project_name=artifact.project_name,
+            project_name=project.project_name if project else "Project",
             source_text=artifact.transcript,
             project_type=artifact.project_type,
             company_name=artifact.company_name,
@@ -1239,6 +1864,9 @@ def refine_artifact(
                 previous_orchestration.get("strategic_analysis_enabled", False)
             ),
             country=artifact.country,
+            model_provider=request.model_provider or previous_project_metadata.get("model_provider") or "openai",
+            reasoning_model=request.reasoning_model or previous_project_metadata.get("reasoning_model"),
+            extraction_model=request.extraction_model or previous_project_metadata.get("extraction_model"),
             prior_analysis=previous_analysis,
             refinement_instruction=refinement_instruction,
         )
@@ -1332,7 +1960,17 @@ def refine_artifact(
     artifact.selected_techniques = request.selected_techniques
     artifact.infer_additional_techniques = request.infer_additional_techniques
     artifact.selected_outputs = request.selected_outputs
-    artifact.source_files = combined_source_file_metadata
+    artifact.source_files = [
+        {
+            key: value
+            for key, value in source.items()
+            if key not in {"content_base64", "storage_id", "extracted_text"}
+        }
+        for source in (
+            updated_analysis.get("source_context", {}).get("source_materials") or []
+        )
+        if source.get("source_reference") != "source:typed"
+    ] or combined_source_file_metadata
 
     db.commit()
     db.refresh(artifact)
@@ -1350,10 +1988,11 @@ def export_artifact(
     db: Session = Depends(get_db),
 ):
     artifact = get_accessible_artifact(db, artifact_id, user)
+    project = project_for_artifact(db, artifact)
 
     try:
         content, filename, media_type = build_export(
-            artifact.project_name,
+            project.project_name if project else "artifact",
             artifact.analysis_json,
             request.sections,
             request.format,
@@ -1502,8 +2141,14 @@ def get_artifact_traceability(
     db: Session = Depends(get_db),
 ):
     artifact = get_accessible_artifact(db, artifact_id, user)
+    project = project_for_artifact(db, artifact)
 
     analysis = artifact.analysis_json or {}
+    source_materials = enrich_source_materials_with_project_context(
+        analysis.get("source_context", {}).get("source_materials") or [],
+        artifact,
+        project,
+    )
     registry = entity_registry(analysis)
     nodes = [
         {key: value for key, value in node.items() if key != "raw"}
@@ -1530,7 +2175,7 @@ def get_artifact_traceability(
         source_links.setdefault(source, []).append(node["id"])
 
     # Reusable evidence is projected only when canonical entities overlap semantically.
-    context_palette = ["#147d92", "#7c3aed", "#b45309", "#047857", "#be123c", "#3f6212"]
+    context_palette = AVATAR_COLORS #["#147d92", "#7c3aed", "#b45309", "#047857", "#be123c", "#3f6212"]
     context_artifacts = accessible_artifacts_query(db, user).filter(
         AnalysisArtifact.id != artifact_id
     ).order_by(AnalysisArtifact.created_at.desc()).limit(20).all()
@@ -1554,13 +2199,15 @@ def get_artifact_traceability(
             })
         color = context_palette[len(existing_project_context) % len(context_palette)]
         entity_types = sorted({match["entity_type"].replace("_", " ") for match in shared_entities})
+        context_project = project_for_artifact(db, context_artifact)
         existing_project_context.append(
             {
-                "project_id": context_artifact.id,
-                "project_name": context_artifact.project_name,
-                "project_code": context_artifact.project_code,
-                "avatar_initials": context_artifact.avatar_initials,
-                "avatar_color": context_artifact.avatar_color,
+                "project_id": context_artifact.project_id,
+                "artifact_id": context_artifact.id,
+                "project_name": context_project.project_name if context_project else "",
+                "project_code": context_project.project_code if context_project else "",
+                "avatar_initials": context_project.avatar_initials if context_project else "",
+                "avatar_color": context_project.avatar_color if context_project else "",
                 "source_color": color,
                 "source_files": context_artifact.source_files or [],
                 "link_summary": (
@@ -1578,13 +2225,21 @@ def get_artifact_traceability(
 
     return {
         "artifact_id": artifact_id,
+        "source_materials": source_materials,
         "nodes": nodes,
         "relationships": relationships,
         "traceability_matrix": traceability_matrix,
         "traceability_links": traceability_links,
         "traceability_chains": traceability_chains,
         "source_traceability": [
-            {"source_reference": source, "entity_ids": entity_ids}
+            {
+                "source_reference": source,
+                "entity_ids": entity_ids,
+                "artifact_id": artifact.id,
+                "project_id": artifact.project_id,
+                "project_name": project.project_name if project else "",
+                "project_code": project.project_code if project else "",
+            }
             for source, entity_ids in source_links.items()
         ],
         "existing_project_context": existing_project_context,
@@ -1611,9 +2266,13 @@ def get_artifact_intelligence(
     analysis = artifact.analysis_json or {}
     return {
         "artifact_id": artifact_id,
+        "source_materials": analysis.get("source_context", {}).get("source_materials") or [],
         "process_intelligence": analysis.get("process_intelligence") or {},
         "test_intelligence": analysis.get("test_intelligence") or {},
+        "requirements_quality": analysis.get("requirements_quality") or {},
         "impact_analysis": analysis.get("impact_analysis") or {},
+        "approval_governance": analysis.get("approval_governance") or {},
+        "diagram_artifacts": analysis.get("diagram_artifacts") or [],
         "executive_translation": analysis.get("executive_translation") or {},
         "enterprise_intelligence": analysis.get("enterprise_intelligence") or {},
     }
@@ -1662,30 +2321,7 @@ def restore_artifact_version(
 
     return {
         "message": "Version restored successfully",
-        "artifact": {
-            "id": artifact.id,
-            "project_name": artifact.project_name,
-            "project_code": artifact.project_code,
-            "avatar_initials": artifact.avatar_initials,
-            "avatar_color": artifact.avatar_color,
-            "project_type": artifact.project_type,
-            "company_name": artifact.company_name,
-            "industry": artifact.industry,
-            "domain": artifact.domain,
-            "analysis_focus_key": artifact.analysis_focus_key,
-            "analysis_focus_chapter": artifact.analysis_focus_chapter,
-            "analysis_focus_area": artifact.analysis_focus_area,
-            "selected_activity_keys": artifact.selected_activity_keys,
-            "selected_activity_labels": artifact.selected_activity_labels,
-            "selected_techniques": artifact.selected_techniques,
-            "infer_additional_techniques": artifact.infer_additional_techniques,
-            "selected_outputs": artifact.selected_outputs,
-            "source_files": artifact.source_files,
-            "country": artifact.country,
-            "analysis": artifact.analysis_json,
-            "current_version_id": artifact.current_version_id,
-            "created_at": artifact.created_at
-        }
+        "artifact": serialize_artifact_response(artifact, artifact.analysis_json, db=db),
     }
 
 @router.put("/analysis-artifacts/{artifact_id}")

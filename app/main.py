@@ -17,7 +17,7 @@ def get_allowed_origins():
     # Enterprise deployments should provide exact app origins through environment config.
     origins = os.getenv(
         "CORS_ALLOWED_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000,https://ai-ba-automation-frontend-o8tozqfzm-damem2007s-projects.vercel.app",
+        "http://localhost:3001,http://192.168.1.67:3001,http://192.168.1.67:3001,https://ai-ba-automation-frontend-o8tozqfzm-damem2007s-projects.vercel.app",
     )
     return [origin.strip() for origin in origins.split(",") if origin.strip()]
 

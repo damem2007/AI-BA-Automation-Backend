@@ -17,11 +17,79 @@ from app.services.source_materials import build_source_bundle, build_source_cont
 load_dotenv()
 
 api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise ValueError("OPENAI_API_KEY environment variable is not set")
-
-client = OpenAI(api_key=api_key)
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MULTIMODAL_MODEL = os.getenv("OPENAI_MULTIMODAL_MODEL", MODEL)
+OPENAI_TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-transcribe")
+LOCAL_QWEN_REASONING_BASE_URL = os.getenv(
+    "LOCAL_QWEN_REASONING_BASE_URL",
+    os.getenv("LOCAL_QWEN_BASE_URL", os.getenv("LOCAL_AI_BASE_URL", "")),
+)
+LOCAL_QWEN_EXTRACTION_BASE_URL = os.getenv(
+    "LOCAL_QWEN_EXTRACTION_BASE_URL",
+    os.getenv("LOCAL_QWEN_BASE_URL", os.getenv("LOCAL_AI_BASE_URL", "")),
+)
+LOCAL_QWEN_API_KEY = os.getenv("LOCAL_QWEN_API_KEY", os.getenv("LOCAL_AI_API_KEY", "local"))
+LOCAL_QWEN_REASONING_MODEL = os.getenv("LOCAL_QWEN_REASONING_MODEL", "Qwen3.6-35B-A3B")
+LOCAL_QWEN_EXTRACTION_MODEL = os.getenv("LOCAL_QWEN_EXTRACTION_MODEL", "Qwen3-Omni-30B-A3B-Instruct")
+HYBRID_REASONING_MODEL = os.getenv("HYBRID_REASONING_MODEL", MODEL)
+HYBRID_EXTRACTION_MODEL = os.getenv("HYBRID_EXTRACTION_MODEL", LOCAL_QWEN_EXTRACTION_MODEL)
+
+
+def _openai_client() -> OpenAI:
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY environment variable is not set")
+    return OpenAI(api_key=api_key)
+
+
+def _local_qwen_client(base_url: str, purpose: str) -> OpenAI:
+    if not base_url:
+        raise ValueError(
+            f"{purpose} local model endpoint is not configured. Set "
+            "LOCAL_QWEN_REASONING_BASE_URL and LOCAL_QWEN_EXTRACTION_BASE_URL."
+        )
+    return OpenAI(api_key=LOCAL_QWEN_API_KEY, base_url=base_url)
+
+
+def model_profile(
+    model_provider: str = "openai",
+    reasoning_model: Optional[str] = None,
+    extraction_model: Optional[str] = None,
+) -> dict:
+    """Resolve the user-selected model provider into concrete clients and model names."""
+    provider = model_provider if model_provider in {"openai", "local_qwen", "hybrid"} else "openai"
+    if provider == "local_qwen":
+        return {
+            "provider": provider,
+            "reasoning_client": _local_qwen_client(LOCAL_QWEN_REASONING_BASE_URL, "Reasoning"),
+            "extraction_client": _local_qwen_client(LOCAL_QWEN_EXTRACTION_BASE_URL, "Extraction"),
+            "reasoning_model": reasoning_model or LOCAL_QWEN_REASONING_MODEL,
+            "extraction_model": extraction_model or LOCAL_QWEN_EXTRACTION_MODEL,
+            "transcription_model": extraction_model or LOCAL_QWEN_EXTRACTION_MODEL,
+            "extraction_provider": "local_qwen",
+            "data_residency_mode": "local_private",
+        }
+    if provider == "hybrid":
+        return {
+            "provider": provider,
+            "reasoning_client": _openai_client(),
+            "extraction_client": _local_qwen_client(LOCAL_QWEN_EXTRACTION_BASE_URL, "Extraction"),
+            "reasoning_model": reasoning_model or HYBRID_REASONING_MODEL,
+            "extraction_model": extraction_model or HYBRID_EXTRACTION_MODEL,
+            "transcription_model": extraction_model or HYBRID_EXTRACTION_MODEL,
+            "extraction_provider": "local_qwen",
+            "data_residency_mode": "hybrid_local_extraction",
+        }
+    openai = _openai_client()
+    return {
+        "provider": "openai",
+        "reasoning_client": openai,
+        "extraction_client": openai,
+        "reasoning_model": reasoning_model or MODEL,
+        "extraction_model": extraction_model or OPENAI_MULTIMODAL_MODEL,
+        "transcription_model": OPENAI_TRANSCRIPTION_MODEL,
+        "extraction_provider": "openai",
+        "data_residency_mode": "hosted",
+    }
 
 def analyze_transcript(
     project_name: str,
@@ -44,11 +112,21 @@ def analyze_transcript(
     country: Optional[str] = None,
     source_intent: str = "unknown",
     source_subtype: Optional[str] = None,
+    model_provider: str = "openai",
+    reasoning_model: Optional[str] = None,
+    extraction_model: Optional[str] = None,
     prior_analysis: Optional[dict] = None,
     refinement_instruction: Optional[str] = None,
 ) -> CBAKFAnalysisOutput:
    # Build canonical context before prompting so UI orchestration drives analysis.
-   prepared_source_files = prepare_source_files_for_analysis(source_files, client)
+   selected_model = model_profile(model_provider, reasoning_model, extraction_model)
+   prepared_source_files = prepare_source_files_for_analysis(
+       source_files,
+       selected_model["extraction_client"],
+       extraction_model=selected_model["extraction_model"],
+       transcription_model=selected_model["transcription_model"],
+       extraction_provider=selected_model["extraction_provider"],
+   )
    source_bundle = build_source_bundle(source_text, prepared_source_files)
    source_context = build_source_context(source_text, prepared_source_files, source_intent=source_intent,
     source_subtype=source_subtype,)
@@ -80,6 +158,10 @@ def analyze_transcript(
        "initiative_type": initiative_type or "",
        "created_at": datetime.now(timezone.utc).isoformat(),
        "analysis_version": "CBAKF-1.0",
+       "model_provider": selected_model["provider"],
+       "reasoning_model": selected_model["reasoning_model"],
+       "extraction_model": selected_model["extraction_model"],
+       "data_residency_mode": selected_model["data_residency_mode"],
    }
    context_prompt = build_context_prompt(
        project_metadata=project_metadata,
@@ -115,8 +197,8 @@ def analyze_transcript(
        )
    full_prompt = f"{context_prompt}{prior_context}\n\n{source_bundle}".strip()
 
-   completion = client.beta.chat.completions.parse(
-        model=MODEL,
+   completion = selected_model["reasoning_client"].beta.chat.completions.parse(
+        model=selected_model["reasoning_model"],
         messages=[
             {
              "role": "system",
@@ -296,7 +378,10 @@ def build_context_prompt(
     - entity_relationships
     - process_intelligence
     - test_intelligence
+    - requirements_quality
     - impact_analysis
+    - approval_governance
+    - diagram_artifacts
     - executive_translation
     - enterprise_intelligence
     - strategic_analysis
@@ -322,6 +407,31 @@ def build_context_prompt(
     Produce detailed BA-ready outputs, not short labels. Each relevant semantic
     entity should describe evidence, impact, relationships, and next-step
     implications where supported by the source material.
+
+    Build a full RAID-grade risk view, not a shallow list. In
+    semantic_model.risks and impact_analysis.implementation_risks, identify
+    evidence-supported business, financial, operational, reputational,
+    customer/client, compliance, audit/control, data, integration, process,
+    delivery, adoption, and support risks whenever the source material supports
+    or strongly implies them. Each risk must describe cause, risk event,
+    consequence, impacted stakeholders or systems, likelihood, impact/severity,
+    priority, owner role when known, mitigation actions or controls,
+    contingency/rollback response, trigger or early warning indicator,
+    residual risk, source_reference, and confidence. Put structured risk
+    attributes in metadata when the canonical entity does not have a dedicated
+    field. Also populate assumptions, issues, and dependencies when the source
+    shows uncertainty, active problems, or delivery reliance.
+
+    When the source describes an incorrect payment/card/charge behavior, do not
+    stop at financial loss. Also assess merchant or customer complaints,
+    loss of business/client attrition, reputational damage, remediation effort,
+    communication/escalation pressure, incorrect billing or reconciliation,
+    charge correction/backout needs, UAT/sign-off gaps, release-control gaps,
+    and patch deployment risk where supported by the evidence. Include concrete
+    mitigations such as scoped fix validation, affected-transaction
+    reconciliation, client/merchant communication, regression testing,
+    approval revalidation, monitoring, rollback planning, and post-incident
+    control improvement when evidenced or strongly implied.
 
     Generate entity_relationships only after extracting the canonical model.
     Relationships must connect meaningful business analysis entities, not merely
@@ -363,11 +473,27 @@ def build_context_prompt(
     residency, scalability, and supportability wherever relevant. Use measurable
     targets only when supported; otherwise add a validation question.
 
-    For impact_analysis, translate the change or source material into impacted
-    systems, workflows, integrations, reports, data entities, roles, controls,
-    downstream processes, testing scope, implementation risks, rollback
-    considerations, release readiness checks, stakeholder notifications, and
-    recommendations.
+    Populate requirements_quality as a senior BA/BSA review layer. Score
+    requirements for clarity, testability, completeness, traceability,
+    feasibility, ambiguity, duplicate/conflict risk, missing acceptance
+    criteria, missing data rules, missing exception paths, missing role/access
+    rules, and sign-off readiness. Do not mark requirements ready for sign-off
+    when blockers remain. Every blocker must cite the affected requirement,
+    quality dimension, recommendation, source_reference, confidence, and
+    whether it blocks UAT, development, stakeholder sign-off, or release.
+
+    For impact_analysis, first determine whether the source material includes
+    a change request, compliance bulletin, feature request, API specification,
+    release note, production issue, implementation change, regulatory notice,
+    vendor release, or operational incident. Translate that change evidence
+    into impacted systems, workflows, integrations, reports, data entities,
+    roles, controls, downstream processes, testing scope, implementation risks,
+    rollback considerations, release readiness checks, stakeholder
+    notifications, and recommendations. Use entity_relationships and the
+    delivery lineage implied by objective-capability-requirement-story-UAT
+    links where available. Do not invent impacts. If an impact is plausible but
+    not directly evidenced, keep it, mark it with lower confidence, and explain
+    the uncertainty in the description or metadata.
 
     For executive_translation, translate executive intent into delivery
     interpretation, impacted capabilities and workflows, system dependencies,
@@ -389,9 +515,33 @@ def build_context_prompt(
     untestable requirement, test-data gap, environment dependency, or UAT
     readiness risk instead of skipping the section or inventing a generic test.
 
+    Treat UAT planning as a first-class delivery output. Test intelligence must
+    explain what proves the solution works, what could break, what data and
+    environments are needed, which regression areas matter, which stakeholders
+    must validate results, and which requirements are not yet test-ready.
+    Include positive tests, negative tests, edge cases, regression candidates,
+    API/interface validations, data reconciliation checks, role/permission
+    scenarios, reporting checks, control/compliance tests, and UAT readiness
+    risks when supported by evidence.
+
     Stakeholders are canonical entities. Preserve who sponsors or owns objectives
     and capabilities, who approves or acts as SME for requirements, which user
     personas execute stories or processes, and who must be consulted or informed.
+
+    Populate approval_governance using stakeholder evidence. Identify approval
+    levels, assigned stakeholder or role, decision right, approval status,
+    sign-off order, RACI candidates, unresolved approval risks, and the artifact
+    entity being approved. If a named approver is not evidenced, use the role
+    and create a validation question instead of inventing a person.
+
+    Populate diagram_artifacts when the source supports a visual model. Generate
+    valid Mermaid syntax for useful BA/BSA diagrams such as flowchart, swimlane,
+    sequence diagram, entity relationship diagram, state diagram, user journey,
+    Gantt/timeline, quadrant chart, requirement diagram, mindmap, Kanban,
+    architecture, event modeling, treemap, Venn, Ishikawa, or tree view.
+    Choose diagram types only when they clarify process, system, data, journey,
+    dependency, risk, approval, or delivery flow. Keep syntax evidence-based and
+    include related_entities, source_reference, confidence, and description.
 
     Do not generate or persist a traceability matrix. Traceability is a dynamic
     API projection built from entity_relationships.

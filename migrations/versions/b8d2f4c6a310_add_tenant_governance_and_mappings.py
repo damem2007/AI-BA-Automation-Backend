@@ -66,7 +66,7 @@ def upgrade() -> None:
         sa.Column("tenant_id", sa.String(), nullable=False),
         sa.Column("name", sa.String(), nullable=False),
         sa.Column("provider_type", sa.String(), nullable=False, server_default="oidc"),
-        sa.Column("issuer", sa.String(), nullable=False, unique=True),
+        sa.Column("issuer", sa.String(), nullable=False),
         sa.Column("audience", sa.String(), nullable=False),
         sa.Column("jwks_url", sa.String(), nullable=False),
         sa.Column("required_scopes", sa.JSON(), nullable=False, server_default="[]"),
@@ -78,6 +78,7 @@ def upgrade() -> None:
         sa.Column("last_synced_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.UniqueConstraint("issuer", name="identity_providers_issuer_key"),
     )
     op.create_index("ix_identity_providers_tenant_id", "identity_providers", ["tenant_id"])
     op.create_index("ix_identity_providers_is_active", "identity_providers", ["is_active"])
@@ -95,7 +96,7 @@ def upgrade() -> None:
     op.create_index("ix_password_reset_tokens_token_hash", "password_reset_tokens", ["token_hash"], unique=True)
 
     op.execute("UPDATE users SET is_global = true, onboarding_status = 'complete' WHERE id = 'user-root-local'")
-    op.execute("UPDATE users SET password_changed_at = NOW() WHERE password_hash IS NOT NULL AND password_changed_at IS NULL")
+    op.execute("UPDATE users SET password_changed_at = CURRENT_TIMESTAMP WHERE password_hash IS NOT NULL AND password_changed_at IS NULL")
     op.execute("INSERT INTO tenant_settings (tenant_id) VALUES ('local') ON CONFLICT (tenant_id) DO NOTHING")
     op.execute(
         """
